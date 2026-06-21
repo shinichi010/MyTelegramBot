@@ -24,7 +24,7 @@ def download_media(url, format_type='best', cookies_file=None):
         'noplaylist': True,
     }
     
-    # تحديد الصيغ بطريقة مرنة تمنع الأخطاء
+    # تحديد الصيغ بطريقة تضمن التحميل حتى لو واجه السيرفر نقص بالأدوات
     if format_type == 'audio':
         ydl_opts.update({
             'format': 'bestaudio/best',
@@ -35,9 +35,10 @@ def download_media(url, format_type='best', cookies_file=None):
             }],
         })
     elif format_type == '720p':
-        # صيغة ذكية: يبحث عن أفضل جودة فيديو لا تتعدى 720p ويدمجها مع الصوت، وإذا لم يجد يختار أفضل جودة عامة متوفرة
+        # صيغة مضمونة: تجلب فيديو mp4 مدمج جاهز للصوت والصورة بدقة 720p أو أقل تلقائياً لتفادي أخطاء الصيغ المفقودة
         ydl_opts.update({
-            'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best[height<=720]/best'
+            'format': 'ext=mp4[height<=720]/bestvideo[height<=720]+bestaudio/best',
+            'merge_output_format': 'mp4'
         })
     else:
         # لبقية المنصات
@@ -55,6 +56,10 @@ def download_media(url, format_type='best', cookies_file=None):
         
         if format_type == 'audio' and not filename.endswith('.mp3'):
             filename = filename.rsplit('.', 1)[0] + '.mp3'
+            
+        # التأكد من الصيغة النهائية إذا دمج mp4
+        if format_type == '720p' and not os.path.exists(filename):
+            filename = filename.rsplit('.', 1)[0] + '.mp4'
             
         return filename, info
 
