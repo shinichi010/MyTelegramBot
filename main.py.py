@@ -1,126 +1,156 @@
 import telebot
-from telebot.types import Message
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import yt_dlp
+import os
+import subprocess
 
-# التوكين مالتك
-TOKEN = '8159446452:AAGtFNGAfMxoC2iPwE06Z0gnW0IUUvmAEa0'
+# جلب التوكن من متغيرات البيئة في ريلواي
+TOKEN = os.getenv('BOT_TOKEN')
+
+# تأكد أن التوكن موجود حتى ما يصير كراش
+if not TOKEN:
+    raise ValueError("لازم تضيف BOT_TOKEN بمتغيرات البيئة (Variables) في Railway!")
+
 bot = telebot.TeleBot(TOKEN)
 
-# قاموس لحفظ بيانات الكروبات (الرتب والاعدادات)
-groups_data = {}
+# مسارات ملفات الكوكيز (لازم ترفعها وي المشروع على GitHub)
+IG_COOKIES = 'ig_cookies.txt'
+X_COOKIES = 'x_cookies.txt'
 
-def get_group_data(chat_id):
-    if chat_id not in groups_data:
-        groups_data[chat_id] = {
-            'locked': False, 
-            'welcome': True, 
-            'anti_links': False,
-            'admins': [], 
-            'vips': []
-        }
-    return groups_data[chat_id]
-
-# --- دوال التحقق من الرتب ---
-def is_owner(chat_id, user_id):
-    try:
-        member = bot.get_chat_member(chat_id, user_id)
-        return member.status == 'creator'
-    except:
-        return False
-
-def is_admin(chat_id, user_id):
-    if is_owner(chat_id, user_id): return True
-    return user_id in get_group_data(chat_id)['admins']
-
-def is_vip(chat_id, user_id):
-    if is_admin(chat_id, user_id): return True
-    return user_id in get_group_data(chat_id)['vips']
-
-# --- الترحيب بالاعضاء الجدد ---
-@bot.message_handler(content_types=['new_chat_members'])
-def welcome_new_member(message: Message):
-    data = get_group_data(message.chat.id)
-    if data['welcome']:
-        for new_member in message.new_chat_members:
-            bot.reply_to(message, f"نورت الكروب يا {new_member.first_name}! 🌹")
-
-# --- اوامر التفعيل والتعطيل (للمالك والمدراء فقط) ---
-@bot.message_handler(commands=['تفعيل_الترحيب', 'تعطيل_الترحيب', 'قفل_الشات', 'فتح_الشات'])
-def toggle_settings(message: Message):
-    if not is_admin(message.chat.id, message.from_user.id):
-        return bot.reply_to(message, "عذراً، هذا الأمر للمدراء فقط.")
+def download_media(url, format_type='best', cookies_file=None):
+    ydl_opts = {
+        'outtmpl': '%(id)s.%(ext)s',
+        'quiet': True,
+        'noplaylist': True,
+    }
     
-    data = get_group_data(message.chat.id)
-    cmd = message.text.replace('/', '')
-
-    if cmd == 'تفعيل_الترحيب':
-        data['welcome'] = True
-        bot.reply_to(message, "✅ تم تفعيل الترحيب.")
-    elif cmd == 'تعطيل_الترحيب':
-        data['welcome'] = False
-        bot.reply_to(message, "❌ تم تعطيل الترحيب.")
-    elif cmd == 'قفل_الشات':
-        data['locked'] = True
-        bot.reply_to(message, "🔒 تم قفل الشات. فقط المميزين والمدراء يكدرون يراسلون.")
-    elif cmd == 'فتح_الشات':
-        data['locked'] = False
-        bot.reply_to(message, "🔓 تم فتح الشات للكل.")
-
-# --- رفع وتنزيل الرتب (بالرد على الرسالة) ---
-@bot.message_handler(func=lambda m: m.text in ['رفع مدير', 'تنزيل مدير', 'رفع مميز', 'تنزيل مميز'] and m.reply_to_message)
-def manage_roles(message: Message):
-    if not is_owner(message.chat.id, message.from_user.id) and 'مدير' in message.text:
-        return bot.reply_to(message, "عذراً، فقط المالك يكدر يرفع مدراء.")
+    # تحديد الصيغ بناءً على الطلب
+    if format_type == 'audio':
+        ydl_opts.update({
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '320',
+            }],
+        })
+    elif format_type == '720p':
+        ydl_opts.update({'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'})
+    else:
+        # لبقية المنصات (تيكتوك، فيسبوك، الخ)
+        ydl_opts.update({'format': 'best'})
     
-    if not is_admin(message.chat.id, message.from_user.id) and 'مميز' in message.text:
-        return bot.reply_to(message, "عذراً، هذا الأمر للمدراء والمالك.")
+    # دمج الكوكيز إذا تم تمريرها وموجودة كملف
+    if cookies_file and os.path.exists(cookies_file):
+        ydl_opts['cookiefile'] = cookies_file
 
-    target_user_id = message.reply_to_message.from_user.id
-    target_name = message.reply_to_message.from_user.first_name
-    data = get_group_data(message.chat.id)
-
-    if message.text == 'رفع مدير':
-        if target_user_id not in data['admins']: data['admins'].append(target_user_id)
-        bot.reply_to(message, f"✅ تم رفع {target_name} كـ مدير.")
-    elif message.text == 'تنزيل مدير':
-        if target_user_id in data['admins']: data['admins'].remove(target_user_id)
-        bot.reply_to(message, f"❌ تم تنزيل {target_name} من الإدارة.")
-    elif message.text == 'رفع مميز':
-        if target_user_id not in data['vips']: data['vips'].append(target_user_id)
-        bot.reply_to(message, f"✅ تم رفع {target_name} كـ مميز.")
-    elif message.text == 'تنزيل مميز':
-        if target_user_id in data['vips']: data['vips'].remove(target_user_id)
-        bot.reply_to(message, f"❌ تم تنزيل {target_name} من المميزين.")
-
-# --- أمر مسح الرسائل ---
-@bot.message_handler(func=lambda m: m.text and m.text.startswith('مسح '))
-def purge_messages(message: Message):
-    if not is_admin(message.chat.id, message.from_user.id):
-        return
-    
-    try:
-        count = int(message.text.split(' ')[1])
-        if count <= 0 or count > 100:
-            return bot.reply_to(message, "الرجاء تحديد رقم بين 1 و 100.")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
         
-        message_id = message.message_id
-        # نحذف رسالة الامر والرسائل اللي قبلها
-        for i in range(count):
-            try:
-                bot.delete_message(message.chat.id, message_id - i)
-            except:
-                pass 
-    except ValueError:
-        bot.reply_to(message, "اكتب الأمر هيج: مسح 10")
+        # تصحيح اسم الملف في حال تم تحويله الى mp3
+        if format_type == 'audio' and not filename.endswith('.mp3'):
+            filename = filename.rsplit('.', 1)[0] + '.mp3'
+            
+        return filename, info
 
-# --- مراقب الشات (حذف رسائل الشات المقفول) ---
-@bot.message_handler(func=lambda m: True, content_types=['text', 'photo', 'video', 'document', 'sticker', 'voice'])
-def chat_monitor(message: Message):
-    data = get_group_data(message.chat.id)
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(message, "هلا بيك! دزلي أي رابط (يوتيوب، تيك توك، انستا، اكس، سبوتيفاي، الخ) وأني أحمله إلك.")
+
+@bot.message_handler(func=lambda message: 'http' in message.text)
+def handle_url(message):
+    url = message.text
+    chat_id = message.chat.id
+    msg = bot.reply_to(message, "جاري المعالجة وتحليل الرابط... ⏳")
+
+    try:
+        # معالجة روابط اليوتيوب (تخيير المستخدم)
+        if 'youtube.com' in url or 'youtu.be' in url:
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("فيديو 720p 🎬", callback_data=f"yt_vid|{url}"),
+                InlineKeyboardButton("مقطع صوتي 🎵", callback_data=f"yt_aud|{url}")
+            )
+            
+            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                title = info.get('title', 'مقطع يوتيوب')
+            
+            bot.edit_message_text(f"معلومات المقطع:\n*{title}*\n\nشنو تحب تحمل؟", 
+                                  chat_id, msg.message_id, reply_markup=markup, parse_mode="Markdown")
+            return
+
+        # معالجة روابط سبوتيفاي عبر SpotDL لجلب اعلى جودة مع الغلاف والمعلومات
+        if 'spotify.com' in url:
+            bot.edit_message_text("جاري تحميل مسار سبوتيفاي بأعلى جودة... 🎵", chat_id, msg.message_id)
+            output_name = f"{chat_id}_spotify.mp3"
+            # استدعاء أداة spotdl
+            subprocess.run(['spotdl', url, '--output', output_name], stdout=subprocess.DEVNULL)
+            
+            if os.path.exists(output_name):
+                with open(output_name, 'rb') as f:
+                    bot.send_audio(chat_id, f)
+                os.remove(output_name)
+                bot.delete_message(chat_id, msg.message_id)
+            else:
+                bot.edit_message_text("فشل تحميل مسار سبوتيفاي.", chat_id, msg.message_id)
+            return
+
+        # تحديد ملف الكوكيز المناسب لباقي المنصات
+        cookies = None
+        if 'instagram.com' in url:
+            cookies = IG_COOKIES
+        elif 'twitter.com' in url or 'x.com' in url:
+            cookies = X_COOKIES
+
+        # التحميل لباقي المنصات
+        filename, info = download_media(url, format_type='best', cookies_file=cookies)
+        
+        bot.edit_message_text("جاري الرفع للتيليجرام... 🚀", chat_id, msg.message_id)
+        
+        # إرسال الملف بناءً على صيغته
+        with open(filename, 'rb') as f:
+            if filename.endswith(('.mp3', '.m4a', '.wav')):
+                bot.send_audio(chat_id, f, title=info.get('title'), performer=info.get('uploader'))
+            elif filename.endswith(('.mp4', '.webm', '.mkv')):
+                bot.send_video(chat_id, f)
+            elif filename.endswith(('.jpg', '.png', '.jpeg')):
+                bot.send_photo(chat_id, f)
+            else:
+                bot.send_document(chat_id, f)
+        
+        # تنظيف الملفات بعد الإرسال
+        os.remove(filename)
+        bot.delete_message(chat_id, msg.message_id)
+
+    except Exception as e:
+        bot.edit_message_text(f"عذراً، صار خطأ: {str(e)}", chat_id, msg.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('yt_'))
+def yt_callback(call):
+    action, url = call.data.split('|', 1)
+    chat_id = call.message.chat.id
     
-    # التحقق من قفل الشات
-    if data['locked']:
-        if not is_vip(message.chat.id, message.from_user.id):
-            bot.delete_message(message.chat.id, message.message_id)
+    bot.edit_message_text("جاري التحميل من يوتيوب... ⏳", chat_id, call.message.message_id)
+    
+    try:
+        format_type = '720p' if action == 'yt_vid' else 'audio'
+        filename, info = download_media(url, format_type=format_type)
+        
+        bot.edit_message_text("جاري الرفع... 🚀", chat_id, call.message.message_id)
+        
+        with open(filename, 'rb') as f:
+            if format_type == 'audio':
+                bot.send_audio(chat_id, f, title=info.get('title'), performer=info.get('uploader'))
+            else:
+                bot.send_video(chat_id, f)
+        
+        os.remove(filename)
+        bot.delete_message(chat_id, call.message.message_id)
+        
+    except Exception as e:
+        bot.edit_message_text(f"صار خطأ بالتحميل: {str(e)}", chat_id, call.message.message_id)
 
-print("Bot is running...")
+print("البوت شغال الآن وينتظر الروابط...")
 bot.infinity_polling()
