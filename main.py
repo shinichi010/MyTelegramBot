@@ -24,24 +24,31 @@ def download_media(url, format_type='best', cookies_file=None):
         'noplaylist': True,
     }
     
-    # تحديد الصيغ بطريقة تضمن التحميل حتى لو واجه السيرفر نقص بالأدوات
+    # تحسين خيارات الصوت لجلب الغلاف والبيانات وصوت نقي 320kbps
     if format_type == 'audio':
         ydl_opts.update({
             'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '320',
-            }],
+            'writethumbnail': True,  # جلب صورة الغلاف
+            'postprocessors': [
+                {
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '320',
+                },
+                {
+                    'key': 'EmbedThumbnail',  # دمج الغلاف داخل ملف الـ mp3
+                },
+                {
+                    'key': 'FFmpegMetadata',  # دمج اسم المغني والالبوم والتفاصيل
+                }
+            ],
         })
     elif format_type == '720p':
-        # صيغة مضمونة: تجلب فيديو mp4 مدمج جاهز للصوت والصورة بدقة 720p أو أقل تلقائياً لتفادي أخطاء الصيغ المفقودة
         ydl_opts.update({
             'format': 'ext=mp4[height<=720]/bestvideo[height<=720]+bestaudio/best',
             'merge_output_format': 'mp4'
         })
     else:
-        # لبقية المنصات
         ydl_opts.update({'format': 'best'})
     
     # دمج الكوكيز
@@ -57,7 +64,6 @@ def download_media(url, format_type='best', cookies_file=None):
         if format_type == 'audio' and not filename.endswith('.mp3'):
             filename = filename.rsplit('.', 1)[0] + '.mp3'
             
-        # التأكد من الصيغة النهائية إذا دمج mp4
         if format_type == '720p' and not os.path.exists(filename):
             filename = filename.rsplit('.', 1)[0] + '.mp4'
             
@@ -65,7 +71,7 @@ def download_media(url, format_type='best', cookies_file=None):
 
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.reply_to(message, "هلا بيك! دزلي أي رابط (يوتيوب، تيك توك، انستا، اكس، سبوتيفاي، الخ) وأني أحمله إلك.")
+    bot.reply_to(message, "هلا بيك بـ REI! دزلي أي رابط (يوتيوب، تيك توك، انستا، اكس، سبوتيفاي، يوتيوب ميوزك) وأني بالخدمة.")
 
 @bot.message_handler(func=lambda message: 'http' in message.text)
 def handle_url(message):
@@ -74,7 +80,23 @@ def handle_url(message):
     msg = bot.reply_to(message, "جاري المعالجة وتحليل الرابط... ⏳")
 
     try:
-        # معالجة روابط اليوتيوب
+        # فحص إذا كان الرابط يوتيوب ميوزك (تحميل مباشر كصوت بأعلى جودة ومعلومات كاملة)
+        if 'music.youtube.com' in url:
+            bot.edit_message_text("جاري جلب الأغنية من يوتيوب ميوزك بأعلى جودة... 🎵", chat_id, msg.message_id)
+            filename, info = download_media(url, format_type='audio')
+            
+            bot.edit_message_text("جاري الرفع... 🚀", chat_id, msg.message_id)
+            with open(filename, 'rb') as f:
+                bot.send_audio(
+                    chat_id, f, 
+                    title=info.get('title'), 
+                    performer=info.get('artist') or info.get('uploader')
+                )
+            os.remove(filename)
+            bot.delete_message(chat_id, msg.message_id)
+            return
+
+        # روابط اليوتيوب العادي (تخيير المستخدم)
         if 'youtube.com' in url or 'youtu.be' in url:
             markup = InlineKeyboardMarkup()
             markup.add(
@@ -94,8 +116,9 @@ def handle_url(message):
                                   chat_id, msg.message_id, reply_markup=markup, parse_mode="Markdown")
             return
 
+        # روابط سبوتيفاي
         if 'spotify.com' in url:
-            bot.edit_message_text("جاري تحميل مسار سبوتيفاي بأعلى جودة... 🎵", chat_id, msg.message_id)
+            bot.edit_message_text("جاري تحميل مسار سبوتيفاي بأعلى جودة والمعلومات... 🎵", chat_id, msg.message_id)
             output_name = f"{chat_id}_spotify.mp3"
             subprocess.run(['spotdl', url, '--output', output_name], stdout=subprocess.DEVNULL)
             
@@ -149,7 +172,11 @@ def yt_callback(call):
         
         with open(filename, 'rb') as f:
             if format_type == 'audio':
-                bot.send_audio(chat_id, f, title=info.get('title'), performer=info.get('uploader'))
+                bot.send_audio(
+                    chat_id, f, 
+                    title=info.get('title'), 
+                    performer=info.get('artist') or info.get('uploader')
+                )
             else:
                 bot.send_video(chat_id, f)
         
@@ -159,5 +186,5 @@ def yt_callback(call):
     except Exception as e:
         bot.edit_message_text(f"صار خطأ بالتحميل: {str(e)}", chat_id, call.message.message_id)
 
-print("البوت شغال الآن وينتظر الروابط...")
+print("الملكة REI جاهزة للعمل... 🚀")
 bot.infinity_polling()
