@@ -7,15 +7,15 @@ import subprocess
 # جلب التوكن من متغيرات البيئة في ريلواي
 TOKEN = os.getenv('BOT_TOKEN')
 
-# تأكد أن التوكن موجود حتى ما يصير كراش
 if not TOKEN:
     raise ValueError("لازم تضيف BOT_TOKEN بمتغيرات البيئة (Variables) في Railway!")
 
 bot = telebot.TeleBot(TOKEN)
 
-# مسارات ملفات الكوكيز (لازم ترفعها وي المشروع على GitHub)
+# مسارات ملفات الكوكيز 
 IG_COOKIES = 'ig_cookies.txt'
 X_COOKIES = 'x_cookies.txt'
+YT_COOKIES = 'yt_cookies.txt'  # ملف كوكيز اليوتيوب الجديد
 
 def download_media(url, format_type='best', cookies_file=None):
     ydl_opts = {
@@ -37,18 +37,19 @@ def download_media(url, format_type='best', cookies_file=None):
     elif format_type == '720p':
         ydl_opts.update({'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'})
     else:
-        # لبقية المنصات (تيكتوك، فيسبوك، الخ)
         ydl_opts.update({'format': 'best'})
     
-    # دمج الكوكيز إذا تم تمريرها وموجودة كملف
+    # دمج الكوكيز للمنصة المحددة
     if cookies_file and os.path.exists(cookies_file):
         ydl_opts['cookiefile'] = cookies_file
+    # إذا كان الرابط يوتيوب وما تمرر كوكيز، نمرر كوكيز اليوتيوب الافتراضية
+    elif ('youtube.com' in url or 'youtu.be' in url) and os.path.exists(YT_COOKIES):
+        ydl_opts['cookiefile'] = YT_COOKIES
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
         
-        # تصحيح اسم الملف في حال تم تحويله الى mp3
         if format_type == 'audio' and not filename.endswith('.mp3'):
             filename = filename.rsplit('.', 1)[0] + '.mp3'
             
@@ -65,7 +66,7 @@ def handle_url(message):
     msg = bot.reply_to(message, "جاري المعالجة وتحليل الرابط... ⏳")
 
     try:
-        # معالجة روابط اليوتيوب (تخيير المستخدم)
+        # معالجة روابط اليوتيوب (تخيير المستخدم) مع دمج الكوكيز أثناء سحب المعلومات
         if 'youtube.com' in url or 'youtu.be' in url:
             markup = InlineKeyboardMarkup()
             markup.add(
@@ -73,7 +74,12 @@ def handle_url(message):
                 InlineKeyboardButton("مقطع صوتي 🎵", callback_data=f"yt_aud|{url}")
             )
             
-            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+            # إعدادات سحب معلومات اليوتيوب مع الكوكيز لمنع قفل البوت
+            ydl_info_opts = {'quiet': True}
+            if os.path.exists(YT_COOKIES):
+                ydl_info_opts['cookiefile'] = YT_COOKIES
+                
+            with yt_dlp.YoutubeDL(ydl_info_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 title = info.get('title', 'مقطع يوتيوب')
             
@@ -81,11 +87,9 @@ def handle_url(message):
                                   chat_id, msg.message_id, reply_markup=markup, parse_mode="Markdown")
             return
 
-        # معالجة روابط سبوتيفاي عبر SpotDL لجلب اعلى جودة مع الغلاف والمعلومات
         if 'spotify.com' in url:
             bot.edit_message_text("جاري تحميل مسار سبوتيفاي بأعلى جودة... 🎵", chat_id, msg.message_id)
             output_name = f"{chat_id}_spotify.mp3"
-            # استدعاء أداة spotdl
             subprocess.run(['spotdl', url, '--output', output_name], stdout=subprocess.DEVNULL)
             
             if os.path.exists(output_name):
@@ -97,19 +101,16 @@ def handle_url(message):
                 bot.edit_message_text("فشل تحميل مسار سبوتيفاي.", chat_id, msg.message_id)
             return
 
-        # تحديد ملف الكوكيز المناسب لباقي المنصات
         cookies = None
         if 'instagram.com' in url:
             cookies = IG_COOKIES
         elif 'twitter.com' in url or 'x.com' in url:
             cookies = X_COOKIES
 
-        # التحميل لباقي المنصات
         filename, info = download_media(url, format_type='best', cookies_file=cookies)
         
         bot.edit_message_text("جاري الرفع للتيليجرام... 🚀", chat_id, msg.message_id)
         
-        # إرسال الملف بناءً على صيغته
         with open(filename, 'rb') as f:
             if filename.endswith(('.mp3', '.m4a', '.wav')):
                 bot.send_audio(chat_id, f, title=info.get('title'), performer=info.get('uploader'))
@@ -120,7 +121,6 @@ def handle_url(message):
             else:
                 bot.send_document(chat_id, f)
         
-        # تنظيف الملفات بعد الإرسال
         os.remove(filename)
         bot.delete_message(chat_id, msg.message_id)
 
