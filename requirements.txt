@@ -1,4 +1,6 @@
 python-telegram-bot==21.6
 yt-dlp
 spotdl
+ffmpeg
+imageio-ffmpeg
 mutagen
