@@ -1,4 +1,4 @@
-pyTelegramBotAPI==4.14.0
+pyTelegramBotAPI==21.6
 yt-dlp
 spotdl
 mutagen
