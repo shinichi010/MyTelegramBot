@@ -15,7 +15,7 @@ bot = telebot.TeleBot(TOKEN)
 # مسارات ملفات الكوكيز 
 IG_COOKIES = 'ig_cookies.txt'
 X_COOKIES = 'x_cookies.txt'
-YT_COOKIES = 'yt_cookies.txt'  # ملف كوكيز اليوتيوب الجديد
+YT_COOKIES = 'yt_cookies.txt'  
 
 def download_media(url, format_type='best', cookies_file=None):
     ydl_opts = {
@@ -24,7 +24,7 @@ def download_media(url, format_type='best', cookies_file=None):
         'noplaylist': True,
     }
     
-    # تحديد الصيغ بناءً على الطلب
+    # تحديد الصيغ بطريقة مرنة تمنع الأخطاء
     if format_type == 'audio':
         ydl_opts.update({
             'format': 'bestaudio/best',
@@ -35,14 +35,17 @@ def download_media(url, format_type='best', cookies_file=None):
             }],
         })
     elif format_type == '720p':
-        ydl_opts.update({'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'})
+        # صيغة ذكية: يبحث عن أفضل جودة فيديو لا تتعدى 720p ويدمجها مع الصوت، وإذا لم يجد يختار أفضل جودة عامة متوفرة
+        ydl_opts.update({
+            'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best[height<=720]/best'
+        })
     else:
+        # لبقية المنصات
         ydl_opts.update({'format': 'best'})
     
-    # دمج الكوكيز للمنصة المحددة
+    # دمج الكوكيز
     if cookies_file and os.path.exists(cookies_file):
         ydl_opts['cookiefile'] = cookies_file
-    # إذا كان الرابط يوتيوب وما تمرر كوكيز، نمرر كوكيز اليوتيوب الافتراضية
     elif ('youtube.com' in url or 'youtu.be' in url) and os.path.exists(YT_COOKIES):
         ydl_opts['cookiefile'] = YT_COOKIES
 
@@ -66,7 +69,7 @@ def handle_url(message):
     msg = bot.reply_to(message, "جاري المعالجة وتحليل الرابط... ⏳")
 
     try:
-        # معالجة روابط اليوتيوب (تخيير المستخدم) مع دمج الكوكيز أثناء سحب المعلومات
+        # معالجة روابط اليوتيوب
         if 'youtube.com' in url or 'youtu.be' in url:
             markup = InlineKeyboardMarkup()
             markup.add(
@@ -74,7 +77,6 @@ def handle_url(message):
                 InlineKeyboardButton("مقطع صوتي 🎵", callback_data=f"yt_aud|{url}")
             )
             
-            # إعدادات سحب معلومات اليوتيوب مع الكوكيز لمنع قفل البوت
             ydl_info_opts = {'quiet': True}
             if os.path.exists(YT_COOKIES):
                 ydl_info_opts['cookiefile'] = YT_COOKIES
