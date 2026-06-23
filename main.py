@@ -16,7 +16,7 @@ WA3ED_LIST = [
     " هلا بالحلو \ ة 🌸",
     "مالي خلقك 😏",
     "اتسرسح منا وليدي 😤",
-    "وعد هسه مشغولة 😅",
+    "انا هسه مشغولة 😅",
 ]
 KHAYROK_LIST = [
     "لو خيروك: تسافر للمستقبل لو للماضي؟ ⏳",
@@ -31,6 +31,17 @@ JOKES_LIST = [
     "ليش الكمبيوتر بارد؟ — لأن عنده ويندوز! 🪟",
     "شو تقول السمكة لما اصطدمت بالحائط؟ — دام! 🐟",
 ]
+# ── إعدادات المطور ──
+DEVELOPER_USERNAME = "snh_1"  # يوزر المطور بدون @
+_DISABLED_PLATFORMS = set()   # المنصات الموقوفة مؤقتاً
+
+def is_dev(user) -> bool:
+    """هل المستخدم هو المطور؟"""
+    return (user.username or '').lower().strip('@') == DEVELOPER_USERNAME.lower()
+
+def platform_enabled(name: str) -> bool:
+    return name not in _DISABLED_PLATFORMS
+
 LANG_FLAG = {
     'ar':'🇸🇦','en':'🇬🇧','tr':'🇹🇷','fa':'🇮🇷','ru':'🇷🇺',
     'fr':'🇫🇷','de':'🇩🇪','es':'🇪🇸','hi':'🇮🇳','zh':'🇨🇳',
@@ -100,14 +111,38 @@ def _load_cookies():
     import base64
     data = os.environ.get('COOKIES_DATA', '').strip()
     if not data:
+        logger.info("ℹ️ COOKIES_DATA not set")
         return
+
+    success = False
+
+    # محاولة 1: base64 مع إزالة الفراغات
     try:
-        content = base64.b64decode(data).decode('utf-8')
-        with open('cookies.txt', 'w', encoding='utf-8') as f:
-            f.write(content)
-        logger.info("✅ cookies.txt loaded from COOKIES_DATA")
+        clean = ''.join(data.split())
+        content = base64.b64decode(clean + '==').decode('utf-8')
+        if '\t' in content:  # تحقق أنه ملف cookies حقيقي
+            with open('cookies.txt', 'w', encoding='utf-8') as f:
+                f.write(content)
+            lines = [l for l in content.splitlines() if l and not l.startswith('#') and '\t' in l]
+            domains = set(l.split('\t')[0].lstrip('.') for l in lines)
+            logger.info(f"✅ cookies.txt loaded (base64) — {len(lines)} cookies — {domains}")
+            success = True
     except Exception as e:
-        logger.error(f"❌ Failed to load cookies: {e}")
+        logger.warning(f"[cookies] base64 failed: {e}")
+
+    # محاولة 2: الـ data نفسها هي محتوى الملف
+    if not success:
+        try:
+            if '\t' in data:
+                with open('cookies.txt', 'w', encoding='utf-8') as f:
+                    f.write(data)
+                logger.info("✅ cookies.txt loaded (plain text)")
+                success = True
+        except Exception as e:
+            logger.error(f"[cookies] plain text failed: {e}")
+
+    if not success:
+        logger.error("❌ Failed to load cookies from COOKIES_DATA")
 _load_cookies()
 
 def db_get(path: str, default=None):
@@ -187,7 +222,7 @@ async def get_target(upd, ctx):
 # 4. الذكاء الاصطناعي
 # ═══════════════════════════════════════════════════════════════════
 async def ask_ai(prompt: str) -> str:
-    api_key = os.environ.get("GEMINI_KEY")
+    api_key = os.environ.get("GEMINI_KEY", "")  # أضف GEMINI_KEY كـ env variable
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
     payload = {
         "systemInstruction": {"parts": [{"text": "أنت مساعد ذكي اسمك سيك، تتحدث باللهجة العراقية أحياناً وتبقى لطيف وخفيف. كن مختصراً ومفيداً."}]},
@@ -198,6 +233,7 @@ async def ask_ai(prompt: str) -> str:
         try:
             r = requests.post(url, json=payload, timeout=30)
             logger.info(f"[AI-Gemini] status={r.status_code}")
+            if not api_key: return "❌ GEMINI_KEY غير مضاف. أضفه كـ environment variable."
             if r.status_code in (401, 403): return "❌ مفتاح Gemini منتهي أو غلط. راجع GEMINI_KEY."
             if r.status_code == 429:
                 # free tier: 15 req/min — انتظر وأعد المحاولة
@@ -364,28 +400,39 @@ async def do_download(url, media_type, quality, mid, cid, ctx, smid, is_photo=Fa
 
 # تيك توك + دوين عبر API
 def tiktok_api(url: str):
-    # normalize douyin URL
+    """تيك توك + دوين عبر tikwm API"""
+    encoded = requests.utils.quote(url, safe='')
     api_urls = [
-        f'https://www.tikwm.com/api/?url={requests.utils.quote(url)}&hd=1',
-        f'https://tikwm.com/api/?url={requests.utils.quote(url)}',
+        f'https://www.tikwm.com/api/?url={encoded}&hd=1',
         f'https://www.tikwm.com/api/?url={url}&hd=1',
+        f'https://tikwm.com/api/?url={encoded}&hd=1',
+        # API بديلة
+        f'https://api.tikmate.app/api/lookup?url={encoded}',
     ]
-    for api_url in api_urls:
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': 'https://www.tikwm.com/',
+        'Origin': 'https://www.tikwm.com',
+    }
+    for api_url in api_urls[:3]:  # tikwm فقط
         try:
-            r = requests.get(api_url, timeout=25,
-                headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0',
-                         'Accept':'application/json','Referer':'https://www.tikwm.com/'}).json()
-            if r.get('code') == 0 and 'data' in r:
-                d = r['data']
-                author_obj = d.get('author',{})
-                author = author_obj.get('unique_id','') if isinstance(author_obj,dict) else str(author_obj)
-                author = author or 'مجهول'
+            r = requests.get(api_url, timeout=30, headers=headers)
+            if r.status_code != 200: continue
+            j = r.json()
+            if j.get('code') == 0 and 'data' in j:
+                d = j['data']
+                author_obj = d.get('author', {})
+                author = (author_obj.get('unique_id','') if isinstance(author_obj,dict) else str(author_obj)) or 'مجهول'
                 music = d.get('music','')
                 if isinstance(music, dict): music = music.get('play','')
-                if d.get('images'): return {'type':'images','data':d['images'],'author':author,'music':music}
+                if d.get('images'):
+                    return {'type':'images','data':d['images'],'author':author,'music':music}
                 vid = d.get('hdplay') or d.get('play') or d.get('wmplay')
-                if vid: return {'type':'video','data':vid,'author':author,'music':music}
-        except Exception as e: logger.error(f"[tikwm] {e}")
+                if vid:
+                    return {'type':'video','data':vid,'author':author,'music':music}
+        except Exception as e:
+            logger.warning(f"[tikwm] {api_url[:50]}: {e}")
     return None
 
 # ═══════════════════════════════════════════════════════════════════
@@ -393,10 +440,18 @@ def tiktok_api(url: str):
 # ═══════════════════════════════════════════════════════════════════
 async def yt_handler(upd, ctx, url, uid):
     msg = upd.message
+    dev = is_dev(msg.from_user)
+
+    if not platform_enabled('youtube'):
+        await msg.reply_text(
+            "🔧 التحميل من يوتيوب موقوف مؤقتاً للصيانة." if not dev else
+            "⚙️ [DEV] يوتيوب موقوف — استخدم /admin لتفعيله."
+        )
+        return
+
     wm = await msg.reply_text("🔍 جاري جلب معلومات الفيديو من يوتيوب...")
 
     def _get_info():
-        # tv_embedded يتجاوز bot detection بدون كوكيز
         clients = [
             ['tv_embedded'],
             ['ios'],
@@ -405,7 +460,8 @@ async def yt_handler(upd, ctx, url, uid):
             ['web_embedded'],
         ]
         if os.path.exists('cookies.txt'):
-            clients.insert(0, ['web'])  # web أفضل مع كوكيز
+            clients.insert(0, ['web'])
+        last_err = ""
         for client in clients:
             try:
                 opts = {
@@ -417,22 +473,28 @@ async def yt_handler(upd, ctx, url, uid):
                 if os.path.exists('cookies.txt'): opts['cookiefile'] = 'cookies.txt'
                 with YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=False)
-                    if info: return info
+                    if info: return info, None
             except Exception as e:
+                last_err = str(e)
                 logger.warning(f"[YT] client {client}: {e}")
                 continue
-        return None
+        return None, last_err
 
-    info = await asyncio.get_running_loop().run_in_executor(None, _get_info)
+    info, last_err = await asyncio.get_running_loop().run_in_executor(None, _get_info)
     if not info:
-        return await wm.edit_text(
-            "❌ فشل جلب بيانات اليوتيوب.\n"
-            "• شغّل: <code>pip install -U yt-dlp</code> على Railway\n"
-            "• أو تأكد أن الرابط عام",
-            parse_mode="HTML"
-        )
+        if dev:
+            await wm.edit_text(
+                f"⚙️ <b>[DEV] فشل يوتيوب</b>\n<code>{last_err[:300]}</code>",
+                parse_mode="HTML"
+            )
+        else:
+            await wm.edit_text(
+                "❌ تعذر جلب بيانات الفيديو.\n"
+                "• تأكد أن الرابط صحيح وعام\n"
+                "• حاول مرة ثانية بعد قليل"
+            )
+        return
 
-    # بناء format_map من المعلومات
     format_map = {}
     for f in info.get('formats', []):
         h = f.get('height')
@@ -445,9 +507,9 @@ async def yt_handler(upd, ctx, url, uid):
     ctx.bot_data[uhash] = url
     ctx.bot_data[url[:60]+'_fmt'] = format_map
 
-    dur = info.get('duration', 0)
+    dur   = info.get('duration', 0)
     views = info.get('view_count', 0)
-    cap = (
+    cap   = (
         f"🎬 <b>{info.get('title','')[:60]}</b>\n"
         f"⏱ {dur//60}:{dur%60:02d}"
         + (f" | 👁 {views:,}" if views else "")
@@ -461,7 +523,6 @@ async def yt_handler(upd, ctx, url, uid):
         await wm.delete()
     except:
         await wm.edit_text(cap, parse_mode="HTML", reply_markup=kb)
-
 
 async def auto_download(upd, ctx, url, cid, platform="🎬", max_height=1440):
     """تحميل تلقائي بأعلى جودة متوفرة (حد أقصى max_height)"""
@@ -609,27 +670,46 @@ async def tiktok_handler(upd, ctx, url, cid, reply_id):
 
     def _dl_tiktok():
         tmp2 = tempfile.mkdtemp()
-        opts = {
+        # قائمة إعدادات للمحاولة واحدة وراء الثانية
+        attempts = []
+        if is_douyin:
+            attempts = [
+                # محاولة 1: douyin عبر yt-dlp بدون extractor args
+                {'format':'best[ext=mp4]/best',
+                 'http_headers':{'User-Agent':'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36'}},
+                # محاولة 2: مع extractor args
+                {'format':'best',
+                 'extractor_args':{'douyin':{'app_name':['trill']}},
+                 'http_headers':{'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'}},
+            ]
+        else:
+            attempts = [
+                # محاولة 1: TikTok بـ user agent عادي
+                {'format':'best[ext=mp4]/best',
+                 'http_headers':{'User-Agent':'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15'}},
+                # محاولة 2: بـ user agent مختلف
+                {'format':'best',
+                 'http_headers':{'User-Agent':'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36'}},
+            ]
+        base_opts = {
             'outtmpl': os.path.join(tmp2,'%(id)s.%(ext)s'),
             'quiet':True,'nocheckcertificate':True,'geo_bypass':True,
-            'ffmpeg_location':FFMPEG,
-            'format':'best[ext=mp4]/best',
-            'merge_output_format':'mp4',
-            'http_headers':{
-                'User-Agent': (
-                    'Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 Chrome/91.0.4472.120 Mobile Safari/537.36'
-                    if is_douyin else
-                    'TikTok 26.2.0 rv:262018 (iPhone; iOS 14.4.2; en_US) Cronet'
-                ),
-            },
+            'ffmpeg_location':FFMPEG,'merge_output_format':'mp4',
         }
-        if is_douyin:
-            opts['extractor_args'] = {'douyin': {'app_name': ['trill']}}
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            for f in os.listdir(tmp2):
-                if f.endswith(('.mp4','.webm','.mkv')):
-                    return os.path.join(tmp2,f), tmp2
+        for attempt in attempts:
+            try:
+                opts = {**base_opts, **attempt}
+                with YoutubeDL(opts) as ydl:
+                    ydl.extract_info(url, download=True)
+                    for f in os.listdir(tmp2):
+                        if f.endswith(('.mp4','.webm','.mkv','.m4v')):
+                            return os.path.join(tmp2,f), tmp2
+            except Exception as e:
+                logger.warning(f"[TikTok attempt] {e}")
+                # نظّف الملفات الجزئية قبل المحاولة التالية
+                for f in os.listdir(tmp2):
+                    try: os.remove(os.path.join(tmp2,f))
+                    except: pass
         return None, tmp2
 
     fp, tmp = await asyncio.get_running_loop().run_in_executor(None, _dl_tiktok)
@@ -643,72 +723,195 @@ async def tiktok_handler(upd, ctx, url, cid, reply_id):
         )
     if tmp: shutil.rmtree(tmp, ignore_errors=True)
 
-async def insta_handler(upd, ctx, url, cid):
-    """انستغرام — ريلز + صور + ستوريات (مع كوكيز)"""
-    msg = upd.message
+async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=False, is_story=False):
+    """تحميل انستغرام — فيديو + صور ثابتة + ستوريات + كاروسيل"""
     has_cookies = os.path.exists('cookies.txt')
-    is_story = '/stories/' in url
-
-    # ستوريات بدون كوكيز
-    if is_story and not has_cookies:
-        return await msg.reply_text(
-            "🔒 <b>تحميل الستوريات يحتاج كوكيز انستغرام</b>\n\n"
-            "الكوكيز غير موجودة على السيرفر حالياً.\n"
-            "تأكد من إضافة <code>COOKIES_DATA</code> بـ Railway وإعادة النشر.",
-            parse_mode="HTML"
-        )
-
-    wm = await msg.reply_text("📸 جاري التحميل من انستغرام...")
     tmp = tempfile.mkdtemp()
-    opts = {
-        'outtmpl': os.path.join(tmp,'%(id)s_%(autonumber)s.%(ext)s'),
-        'quiet':True,'noplaylist':False,'nocheckcertificate':True,
-        'ffmpeg_location':FFMPEG,
-        'format':'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'merge_output_format':'mp4',
-        'http_headers':{'User-Agent':'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15'},
+    ua = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+    base_opts = {
+        'outtmpl': os.path.join(tmp, '%(id)s_%(autonumber)03d.%(ext)s'),
+        'quiet': True, 'nocheckcertificate': True, 'geo_bypass': True,
+        'ffmpeg_location': FFMPEG,
+        'http_headers': {'User-Agent': ua},
     }
-    if has_cookies: opts['cookiefile'] = 'cookies.txt'
+    if has_cookies: base_opts['cookiefile'] = 'cookies.txt'
+    use_playlist = download_all or not is_story
+
+    def _extract_image_urls(info):
+        """استخرج روابط الصور من info object"""
+        urls = []
+        if not info: return urls
+        # كاروسيل (entries)
+        entries = info.get('entries') or []
+        if entries:
+            for e in entries:
+                if e.get('thumbnail'): urls.append(e['thumbnail'])
+                # لو عنده formats وكلها صور
+                for f in e.get('formats', []):
+                    if f.get('ext') in ('jpg','jpeg','png','webp') or                        (f.get('url') and any(x in f.get('url','') for x in ('jpg','jpeg','png','webp','cdninstagram'))):
+                        urls.append(f['url'])
+                        break
+        else:
+            if info.get('thumbnail'): urls.append(info['thumbnail'])
+            for f in info.get('formats', []):
+                if f.get('ext') in ('jpg','jpeg','png','webp') or                    (f.get('url') and 'cdninstagram' in f.get('url','')):
+                    urls.append(f['url'])
+                    break
+        return list(dict.fromkeys(urls))  # أزل التكرار
 
     def _dl():
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            videos = sorted(
-                [os.path.join(tmp,f) for f in os.listdir(tmp) if f.endswith(('.mp4','.webm','.mkv'))],
-                key=os.path.getsize, reverse=True
-            )
-            images = [os.path.join(tmp,f) for f in os.listdir(tmp) if f.endswith(('.jpg','.jpeg','.png','.webp'))]
-            return videos, images, info.get('title','انستغرام')
+        title = username or 'انستغرام'
+        image_urls_from_info = []
+
+        # الخطوة 1: جلب المعلومات بدون تحميل لاستخراج روابط الصور
+        try:
+            info_opts = {**base_opts, 'skip_download': True, 'noplaylist': not use_playlist}
+            with YoutubeDL(info_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info:
+                    title = info.get('title', title)
+                    image_urls_from_info = _extract_image_urls(info)
+        except Exception as e:
+            logger.warning(f"[Insta info] {e}")
+
+        # الخطوة 2: محاولة تحميل الفيديو
+        for fmt_opts in [
+            {'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+             'merge_output_format': 'mp4', 'noplaylist': not use_playlist},
+            {'format': 'best[ext=mp4]/best', 'noplaylist': not use_playlist},
+        ]:
+            try:
+                opts = {**base_opts, **fmt_opts}
+                with YoutubeDL(opts) as ydl:
+                    ydl.extract_info(url, download=True)
+                if any(f.endswith(('.mp4','.webm','.mkv')) for f in os.listdir(tmp)):
+                    break
+            except Exception as e:
+                logger.warning(f"[Insta video dl] {e}")
+
+        # الخطوة 3: تحميل الصور من الروابط مباشرة
+        downloaded_imgs = []
+        if image_urls_from_info:
+            hdrs = {'User-Agent': ua, 'Referer': 'https://www.instagram.com/'}
+            for idx, img_url in enumerate(image_urls_from_info[:20]):
+                try:
+                    r = requests.get(img_url, headers=hdrs, timeout=20)
+                    if r.status_code == 200 and len(r.content) > 5000:
+                        ext = 'jpg'
+                        ct = r.headers.get('content-type', '')
+                        if 'png' in ct: ext = 'png'
+                        elif 'webp' in ct: ext = 'webp'
+                        fpath = os.path.join(tmp, f'img_{idx:03d}.{ext}')
+                        with open(fpath, 'wb') as f:
+                            f.write(r.content)
+                        downloaded_imgs.append(fpath)
+                except Exception as e:
+                    logger.warning(f"[Insta img dl] {e}")
+
+        all_files = [os.path.join(tmp,f) for f in os.listdir(tmp) if os.path.isfile(os.path.join(tmp,f))]
+        videos = sorted(
+            [f for f in all_files if f.endswith(('.mp4','.webm','.mkv'))],
+            key=os.path.getsize, reverse=True
+        )
+        video_stems = {os.path.splitext(v)[0] for v in videos}
+        images = sorted(
+            [f for f in all_files
+             if f.endswith(('.jpg','.jpeg','.png','.webp'))
+             and os.path.getsize(f) > 3000
+             and os.path.splitext(f)[0] not in video_stems],
+            key=os.path.getsize, reverse=True
+        )
+        return videos, images, title
+
+    async def _send(videos, images, title):
+        await wm.edit_text(f"📤 جاري الرفع...")
+        sent = 0
+        for v in videos[:5]:
+            if os.path.getsize(v) < 50*1024*1024:
+                with open(v,'rb') as f:
+                    await ctx.bot.send_video(cid, f, caption=f"📸 {title[:60]}", supports_streaming=True)
+                sent += 1
+        if images:
+            for i in range(0, min(len(images),20), 10):
+                batch = images[i:i+10]
+                if len(batch) == 1:
+                    with open(batch[0],'rb') as f:
+                        await ctx.bot.send_photo(cid, f, caption=f"📸 {title[:60]}")
+                else:
+                    handles=[]; grp=[]
+                    for img in batch:
+                        fh=open(img,'rb'); handles.append(fh)
+                        grp.append(InputMediaPhoto(fh))
+                    try: await ctx.bot.send_media_group(cid, grp)
+                    finally:
+                        for fh in handles: fh.close()
+                sent += len(batch)
+                if i+10 < len(images): await asyncio.sleep(1)
+        await wm.delete()
 
     try:
         videos, images, title = await asyncio.get_running_loop().run_in_executor(None, _dl)
         if not videos and not images:
-            return await wm.edit_text("❌ ما لقيت محتوى.\nتأكد أن الحساب عام.")
-        await wm.edit_text("📤 جاري الرفع...")
-        for v in videos[:3]:
-            with open(v,'rb') as f:
-                await ctx.bot.send_video(cid, f, caption=f"📸 {title[:60]}", supports_streaming=True)
-        if images:
-            for i in range(0, len(images[:20]), 10):
-                batch = images[i:i+10]
-                handles = []; media = []
-                for img in batch:
-                    fh = open(img,'rb'); handles.append(fh)
-                    media.append(InputMediaPhoto(fh))
-                try: await ctx.bot.send_media_group(cid, media)
-                finally:
-                    for fh in handles: fh.close()
-                if i+10 < len(images): await asyncio.sleep(1)
-        await wm.delete()
+            await wm.edit_text(
+                "❌ ما لقيت محتوى.\n"
+                + ("• أضف كوكيز انستغرام للمحتوى الخاص\n" if not has_cookies else "")
+                + "• تأكد أن الحساب عام"
+            )
+            return
+        await _send(videos, images, title)
     except Exception as e:
-        logger.error(f"[Insta] {e}")
-        hint = "\n💡 اذا تكررت المشكلة ارسلها للحساب @shn_1 " if not has_cookies else ""
-        await wm.edit_text(f"❌ فشل التحميل من انستغرام.{hint}")
-    finally: shutil.rmtree(tmp, ignore_errors=True)
+        err = str(e)
+        logger.error(f"[Insta] {err}")
+        if 'login' in err.lower() or 'checkpoint' in err.lower():
+            await wm.edit_text("🔒 انستغرام يطلب تسجيل دخول. جدّد الكوكيز.")
+        elif 'private' in err.lower():
+            await wm.edit_text("❌ الحساب خاص.")
+        else:
+            await wm.edit_text(f"❌ فشل: {err[:120]}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def insta_handler(upd, ctx, url, cid):
+    """انستغرام — ريلز + صور + ستوريات"""
+    msg = upd.message
+    has_cookies = os.path.exists('cookies.txt')
+    is_story = '/stories/' in url
+
+    if is_story:
+        if not has_cookies:
+            return await msg.reply_text(
+                "🔒 <b>تحميل الستوريات يحتاج كوكيز انستغرام</b>\n\n"
+                "الكوكيز غير موجودة على السيرفر.\n"
+                "أضف <code>COOKIES_DATA</code> بـ Railway.",
+                parse_mode="HTML"
+            )
+        # استخرج اليوزرنيم من الرابط
+        m = re.search(r'/stories/([^/?]+)', url)
+        username = m.group(1) if m else 'مجهول'
+        # رابط كل الستوريات
+        all_url = f"https://www.instagram.com/stories/{username}/"
+
+        # خزّن بيانات الستوري
+        shash = str(random.randint(10000,99999))
+        ctx.bot_data[f'ist_{shash}'] = {'url': url, 'all_url': all_url, 'uname': username}
+
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📥 هذا الستوري", callback_data=f"ist_one_{shash}"),
+            InlineKeyboardButton("📥 جميع الستوريات", callback_data=f"ist_all_{shash}")
+        ]])
+        return await msg.reply_text(
+            f"📸 <b>ستوريات @{username}</b>\nاختر:",
+            parse_mode="HTML", reply_markup=markup
+        )
+
+    # منشورات عادية (ريلز / صور)
+    wm = await msg.reply_text("📸 جاري التحميل من انستغرام...")
+    await _insta_download_and_send(ctx, cid, url, wm)
 
 
 async def insta_stories_handler(upd, ctx, username, cid):
-    """ستوريات انستغرام بالـ cookies"""
+    """ستوري @username — يعرض زرين"""
     msg = upd.message
     username = username.lstrip('@').strip()
     has_cookies = os.path.exists('cookies.txt')
@@ -716,76 +919,22 @@ async def insta_stories_handler(upd, ctx, username, cid):
     if not has_cookies:
         return await msg.reply_text(
             "🔒 <b>تحميل الستوريات يحتاج كوكيز انستغرام</b>\n\n"
-            "أضف <code>COOKIES_DATA</code> من انستغرام بنفس طريقة X.\n"
-            "بعدها يشتغل تلقائياً! ✅",
+            "أضف <code>COOKIES_DATA</code> من انستغرام.",
             parse_mode="HTML"
         )
 
-    url = f"https://www.instagram.com/stories/{username}/"
-    wm = await msg.reply_text(f"📸 جاري تحميل ستوريات @{username}...")
-    tmp = tempfile.mkdtemp()
-    opts = {
-        'outtmpl': os.path.join(tmp,'%(id)s_%(autonumber)s.%(ext)s'),
-        'quiet': True, 'noplaylist': False, 'nocheckcertificate': True,
-        'ffmpeg_location': FFMPEG,
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'merge_output_format': 'mp4',
-        'cookiefile': 'cookies.txt',
-        'http_headers': {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15'},
-    }
+    all_url = f"https://www.instagram.com/stories/{username}/"
+    shash = str(random.randint(10000,99999))
+    ctx.bot_data[f'ist_{shash}'] = {'url': all_url, 'all_url': all_url, 'uname': username}
 
-    def _dl():
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            videos = sorted(
-                [os.path.join(tmp,f) for f in os.listdir(tmp) if f.endswith(('.mp4','.webm','.mkv'))],
-                key=os.path.getsize, reverse=True
-            )
-            images = [os.path.join(tmp,f) for f in os.listdir(tmp) if f.endswith(('.jpg','.jpeg','.png','.webp'))]
-            return videos, images
-
-    try:
-        videos, images = await asyncio.get_running_loop().run_in_executor(None, _dl)
-        total = len(videos) + len(images)
-        if not total:
-            return await wm.edit_text(
-                f"❌ ما لقيت ستوريات لـ @{username}\n"
-                "• الحساب خاص؟ تأكد أن الكوكيز من حساب يتابعه\n"
-                "• الستوريات قد تكون منتهية"
-            )
-        await wm.edit_text(f"📤 جاري رفع {total} ستوري...")
-        for v in videos[:5]:
-            with open(v,'rb') as f:
-                await ctx.bot.send_video(cid, f, caption=f"📸 @{username}", supports_streaming=True)
-        if images:
-            for i in range(0, min(len(images), 20), 10):
-                batch = images[i:i+10]
-                handles = []; media = []
-                for img in batch:
-                    fh = open(img,'rb'); handles.append(fh)
-                    media.append(InputMediaPhoto(fh))
-                try: await ctx.bot.send_media_group(cid, media)
-                finally:
-                    for fh in handles: fh.close()
-                if i+10 < len(images): await asyncio.sleep(1)
-        await wm.delete()
-    except Exception as e:
-        err = str(e)
-        logger.error(f"[Stories] {err}")
-        if 'login' in err.lower() or 'checkpoint' in err.lower() or 'authentication' in err.lower():
-            await wm.edit_text(
-                "🔒 <b>انستغرام يطلب تسجيل دخول</b>\n\n"
-                "الكوكيز موجودة بس انستغرام يرفضها.\n"
-                "جرب تجيب كوكيز جديدة من المتصفح بعد تسجيل الدخول مجدداً.",
-                parse_mode="HTML"
-            )
-        elif 'private' in err.lower():
-            await wm.edit_text("❌ هذا الحساب خاص ولا تتابعه.")
-        elif 'not found' in err.lower() or '404' in err:
-            await wm.edit_text("❌ ما لقيت هذه الستوريات — ربما انتهت أو الحساب مو موجود.")
-        else:
-            await wm.edit_text(f"❌ فشل تحميل الستوريات:\n<code>{err[:150]}</code>", parse_mode="HTML")
-    finally: shutil.rmtree(tmp, ignore_errors=True)
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📥 آخر ستوري", callback_data=f"ist_one_{shash}"),
+        InlineKeyboardButton("📥 جميع الستوريات", callback_data=f"ist_all_{shash}")
+    ]])
+    await msg.reply_text(
+        f"📸 <b>ستوريات @{username}</b>\nاختر:",
+        parse_mode="HTML", reply_markup=markup
+    )
 
 
 async def pinterest_handler(upd, ctx, url, cid):
@@ -894,108 +1043,88 @@ async def music_handler(upd, ctx, url, cid, platform="🎵"):
         else:
             await wm.edit_text("❌ فشل التحميل.")
     except Exception as e:
-        logger.error(f"[Music] {e}")
-        await wm.edit_text(f"❌ فشل التحميل: {str(e)[:100]}")
+        err = str(e)
+        logger.error(f"[Music] {err}")
+        if 'sign in' in err.lower() or 'bot' in err.lower():
+            has_yt_c = 'youtube.com' in open('cookies.txt').read() if os.path.exists('cookies.txt') else False
+            if not has_yt_c:
+                await wm.edit_text(
+                    "❌ يوتيوب يطلب تسجيل دخول.\n\n"
+                    "🍪 أضف كوكيز يوتيوب لـ COOKIES_DATA\n"
+                    "(نفس طريقة X — من youtube.com أو music.youtube.com)"
+                )
+            else:
+                await wm.edit_text("❌ يوتيوب يرفض الكوكيز. جدّدها.")
+        else:
+            await wm.edit_text(f"❌ فشل التحميل: {err[:100]}")
     finally: shutil.rmtree(tmp, ignore_errors=True)
 
 async def spotify_handler(upd, ctx, url, cid):
-    """سبوتيفاي — تحميل عبر spotdl مع ربط ميكانيكي صريح لـ ffmpeg لمنع الـ FFmpegError"""
-    import html  # مكتبة أساسية لتنظيف النصوص ومنع أخطاء تليجرام
+    """سبوتيفاي — تحميل عبر yt-dlp مباشرة (لا يحتاج Deno)"""
     msg = upd.message
-    wm = await msg.reply_text("🎧 جاري البحث عن المقطع وتحميله من سبوتيفاي...")
+    wm = await msg.reply_text("🎧 جاري التحميل من سبوتيفاي...")
     tmp = tempfile.mkdtemp()
 
     def _dl():
-        import sys, shutil as _shutil
-        import imageio_ffmpeg  # استدعاء المكتبة للوصول للملف التنفيذي الأصلي
-        
-        # 1. حل مشكلة تسمية FFMPEG لـ spotdl جذرياً
-        try:
-            ffmpeg_real_path = imageio_ffmpeg.get_ffmpeg_exe()
-            local_ffmpeg_path = os.path.join(tmp, 'ffmpeg')
-            
-            # إنشاء اختصار صريح باسم 'ffmpeg' داخل المجلد المؤقت ليطابق طلب الأداة
-            if not os.path.exists(local_ffmpeg_path):
-                try:
-                    os.symlink(ffmpeg_real_path, local_ffmpeg_path)
-                except Exception:
-                    # حل بديل في حال لم يدعم السيرفر الـ Symlink نقوم بنسخه فوراً
-                    _shutil.copy(ffmpeg_real_path, local_ffmpeg_path)
-                # إعطاء صلاحيات التشغيل للملف
-                os.chmod(local_ffmpeg_path, 0o755)
-        except Exception as fe:
-            logger.error(f"[Spotify FFMPEG Setup Error] {fe}")
+        import sys, shutil as _sh
+        # spotdl مع --audio youtube-music يستخدم yt-dlp ولا يحتاج Deno
+        spotdl = _sh.which('spotdl') or None
+        if not spotdl:
+            spotdl = os.path.join(os.path.dirname(sys.executable), 'spotdl')
+        if not spotdl or not os.path.exists(spotdl):
+            # fallback: شغّله كـ module
+            spotdl = None
 
-        # 2. حقن المجلد المؤقت في بداية الـ PATH لكي ترى الأداة ملف الـ ffmpeg الجديد فوراً
         env = os.environ.copy()
-        env["PATH"] = tmp + os.pathsep + env.get("PATH", "")
+        env['PATH'] = os.path.dirname(FFMPEG) + os.pathsep + env.get('PATH', '')
 
-        # العثور على أداة spotdl بالسيرفر
-        spotdl_bin = (
-            _shutil.which('spotdl') or
-            _shutil.which(os.path.join(os.path.dirname(sys.executable), 'spotdl')) or
-            None
+        base_cmd = (
+            [spotdl, url, '--output', tmp, '--format', 'mp3', '--bitrate', '320k', '--threads', '1']
+            if spotdl else
+            [sys.executable, '-m', 'spotdl', url, '--output', tmp,
+             '--format', 'mp3', '--bitrate', '320k', '--threads', '1']
         )
-        
-        if spotdl_bin:
-            cmd = [spotdl_bin, url]
-        else:
-            cmd = [sys.executable, '-m', 'spotdl', url]
-            
-        logger.info(f"[spotdl] cmd: {' '.join(cmd)}")
-        
-        # تشغيل الأداة بداخل المجلد المؤقت مع تمرير البيئة المحقونة
-        result = subprocess.run(cmd, cwd=tmp, capture_output=True, text=True, timeout=300, env=env)
-        
-        # البحث عن الملفات الصوتية الناتجة بمختلف الامتدادات
-        files = [os.path.join(tmp, f) for f in os.listdir(tmp) if f.endswith(('.mp3', '.m4a', '.opus', '.wav', '.ogg'))]
-        return files, result.returncode, result.stdout, result.stderr
+        # جرب عدة مصادر: youtube-music أولاً ثم soundcloud
+        last_stderr = ''
+        for audio_src in ['youtube-music', 'soundcloud', 'youtube']:
+            try:
+                cmd = base_cmd + ['--audio', audio_src]
+                logger.info(f"[spotdl] trying {audio_src}")
+                r = subprocess.run(cmd, cwd=tmp, capture_output=True, text=True,
+                                   timeout=240, env=env)
+                files_now = [os.path.join(tmp, f) for f in os.listdir(tmp)
+                             if f.endswith(('.mp3', '.m4a', '.ogg'))]
+                if files_now:
+                    logger.info(f"[spotdl] success with {audio_src}")
+                    return files_now, r.stdout, r.stderr
+                last_stderr = r.stderr
+            except Exception as e:
+                logger.warning(f"[spotdl] {audio_src} failed: {e}")
+                last_stderr = str(e)
+        return [], '', last_stderr
 
     try:
-        files, returncode, stdout, stderr = await asyncio.get_running_loop().run_in_executor(None, _dl)
-        
+        files, stdout, stderr = await asyncio.get_running_loop().run_in_executor(None, _dl)
         if not files:
-            error_log = ""
-            if stderr and stderr.strip():
-                safe_stderr = html.escape(stderr.strip()[:1500])
-                error_log += f"<b>⚙️ STDERR:</b>\n<code>{safe_stderr}</code>\n\n"
-            if stdout and stdout.strip():
-                safe_stdout = html.escape(stdout.strip()[:1500])
-                error_log += f"<b>📊 STDOUT:</b>\n<code>{safe_stdout}</code>"
-            
-            if not error_log:
-                error_log = "لم يتم استخراج أي ملفات صوتية (قد يكون الرابط خاصاً أو السيرفر محظوراً من يوتيوب)."
-
+            # استخرج اسم الأغنية وابحث عليها بـ YouTube Music كـ fallback
             return await wm.edit_text(
-                f"❌ فشل التحميل من سبوتيفاي.\n\n"
-                f"<b>تقرير الأداة الكامل للصيانة:</b>\n{error_log}\n\n"
-                f"💡 إذا كان الخطأ متعلقاً بالـ Sign in أو الـ Block، تأكد من تحديث الكوكيز بـ COOKIES_DATA.",
-                parse_mode="HTML"
+                "❌ فشل التحميل من سبوتيفاي.\n\n"
+                "💡 انسخ اسم الأغنية وابعثه لـ يوتيوب ميوزك:\n"
+                "music.youtube.com وأرسل الرابط هنا 🎵"
             )
-            
-        await wm.edit_text(f"📤 جاري رفع {len(files)} مقطع...")
+        await wm.edit_text(f"📤 جاري الرفع {len(files)} مقطع...")
         for fp in files[:10]:
-            name = os.path.basename(fp)
-            for ext in ['.mp3', '.m4a', '.opus', '.wav', '.ogg']:
-                if name.endswith(ext):
-                    name = name.replace(ext, '')
-                    break
+            name = os.path.basename(fp).rsplit('.', 1)[0]
             with open(fp, 'rb') as f:
-                await ctx.bot.send_audio(cid, f, title=name[:64], caption=f"🎧 {name[:60]}")
+                await ctx.bot.send_audio(cid, f,
+                    title=name[:64], caption=f"🎧 {name[:60]}")
         await wm.delete()
-    except FileNotFoundError:
-        await wm.edit_text(
-            "❌ أداة spotdl غير مثبتة بالسيرفر!\n"
-            "تأكد من إضافتها لملف <code>requirements.txt</code> الخاص بك.",
-            parse_mode="HTML"
-        )
-    except subprocess.TimeoutExpired:
-        await wm.edit_text("❌ انتهى الوقت المحدد (Timeout). المقطع قد يكون طويلاً جداً.")
     except Exception as e:
         logger.error(f"[Spotify] {e}")
-        await wm.edit_text(f"❌ خطأ غير متوقع: {str(e)[:100]}")
-    finally: 
+        await wm.edit_text(f"❌ خطأ: {str(e)[:100]}")
+    finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
 
 async def tiktok_user_info(upd, ctx, username, cid):
     """معلومات حساب تيك توك"""
@@ -1168,6 +1297,50 @@ async def tiktok_user_info(upd, ctx, username, cid):
         logger.error(f"[TT info] {e}")
         await wm.edit_text(f"❌ خطأ: {str(e)[:100]}")
         
+async def cmd_admin(upd, ctx):
+    """لوحة تحكم المطور — للمطور فقط"""
+    msg = upd.message
+    if not is_dev(msg.from_user):
+        return await msg.reply_text("❌ هذا الأمر للمطور فقط.")
+
+    platforms = ['youtube', 'instagram', 'tiktok', 'facebook', 'x', 'spotify', 'soundcloud', 'pinterest']
+    status_lines = []
+    for p in platforms:
+        icon = "🟢" if platform_enabled(p) else "🔴"
+        status_lines.append(f"{icon} {p}")
+
+    cookies_ok = os.path.exists('cookies.txt')
+    if cookies_ok:
+        try:
+            with open('cookies.txt', 'r') as f: c = f.read()
+            lines = [l for l in c.splitlines() if l and not l.startswith('#') and '\t' in l]
+            domains = set(l.split('\t')[0].lstrip('.') for l in lines)
+            cookie_info = f"✅ {len(lines)} cookie — {', '.join(sorted(domains))}"
+        except:
+            cookie_info = "⚠️ موجود لكن تعذر قراءته"
+    else:
+        cookie_info = "❌ غير موجود"
+
+    db_size = os.path.getsize(os.environ.get('DB_PATH','bot_data.db')) // 1024 if os.path.exists(os.environ.get('DB_PATH','bot_data.db')) else 0
+
+    rows = []
+    for p in platforms:
+        action = "وقف" if platform_enabled(p) else "شغّل"
+        rows.append([InlineKeyboardButton(f"{'🔴 ' if platform_enabled(p) else '🟢 '}{action} {p}",
+                                          callback_data=f"adm_toggle_{p}")])
+    rows.append([InlineKeyboardButton("🔄 تحديث", callback_data="adm_refresh"),
+                 InlineKeyboardButton("🍪 فحص كوكيز", callback_data="adm_cookies")])
+
+    await msg.reply_text(
+        f"⚙️ <b>لوحة تحكم المطور</b>\n\n"
+        f"<b>المنصات:</b>\n" + "\n".join(status_lines) + "\n\n"
+        f"<b>🍪 الكوكيز:</b> {cookie_info}\n"
+        f"<b>💾 قاعدة البيانات:</b> {db_size} KB\n"
+        f"<b>🤖 البوت:</b> @{ctx.bot.username}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows)
+    )
+
 async def cmd_help(upd, ctx):
     """أمر المساعدة"""
     msg = upd.message
@@ -1366,6 +1539,67 @@ async def btn_cb(upd, ctx):
         await q.message.delete()
         return
 
+    # ── أزرار لوحة المطور ──
+    if d.startswith("adm_"):
+        if not is_dev(q.from_user):
+            return await q.answer("❌ للمطور فقط!", show_alert=True)
+        action = d[4:]
+        if action.startswith("toggle_"):
+            platform = action[7:]
+            if platform in _DISABLED_PLATFORMS:
+                _DISABLED_PLATFORMS.discard(platform)
+                await q.answer(f"✅ {platform} مفعّل")
+            else:
+                _DISABLED_PLATFORMS.add(platform)
+                await q.answer(f"🔴 {platform} موقوف")
+            # تحديث الرسالة
+            await cmd_admin_refresh(q)
+            return
+        if action == "refresh":
+            await q.answer("🔄 تم التحديث")
+            await cmd_admin_refresh(q)
+            return
+        if action == "cookies":
+            if os.path.exists('cookies.txt'):
+                try:
+                    with open('cookies.txt','r') as f: c = f.read()
+                    lines = [l for l in c.splitlines() if l and not l.startswith('#') and '\t' in l]
+                    domains = set(l.split('\t')[0].lstrip('.') for l in lines)
+                    await q.answer(f"✅ {len(lines)} cookies\n{', '.join(sorted(domains))}", show_alert=True)
+                except Exception as e:
+                    await q.answer(f"❌ {e}", show_alert=True)
+            else:
+                raw = os.environ.get('COOKIES_DATA','')
+                await q.answer(f"❌ cookies.txt غير موجود\nCOOKIES_DATA: {'موجود' if raw else 'مو موجود'} ({len(raw)} حرف)", show_alert=True)
+            return
+        return
+
+    # ── أزرار ستوريات انستغرام ──
+    if d.startswith("ist_"):
+        parts = d.split('_')
+        action = parts[1]   # one أو all
+        shash  = parts[2]
+        data   = ctx.bot_data.get(f'ist_{shash}')
+        if not data:
+            return await q.answer("انتهت صلاحية الأزرار. أرسل الرابط مجدداً.", show_alert=True)
+
+        await q.answer()
+        cid_q = q.message.chat_id
+        wm    = await q.message.edit_text("⏳ جاري التحميل...")
+
+        url      = data['url']      # رابط الستوري المحدد (أو الكل)
+        all_url  = data['all_url']  # رابط كل الستوريات
+        uname    = data['uname']
+
+        if action == 'one':
+            await _insta_download_and_send(ctx, cid_q, url, wm,
+                                           username=uname, download_all=False, is_story=True)
+        else:
+            await _insta_download_and_send(ctx, cid_q, all_url, wm,
+                                           username=uname, download_all=True, is_story=True)
+        ctx.bot_data.pop(f'ist_{shash}', None)
+        return
+
     # إكس أو
     if d.startswith("ttt_"):
         parts = d.split('_')
@@ -1489,6 +1723,29 @@ async def btn_cb(upd, ctx):
 # ═══════════════════════════════════════════════════════════════════
 # 10. معالجات متنوعة
 # ═══════════════════════════════════════════════════════════════════
+async def cmd_admin_refresh(q):
+    """تحديث رسالة لوحة المطور"""
+    platforms = ['youtube', 'instagram', 'tiktok', 'facebook', 'x', 'spotify', 'soundcloud', 'pinterest']
+    status_lines = [f"{'🟢' if platform_enabled(p) else '🔴'} {p}" for p in platforms]
+    cookies_ok = os.path.exists('cookies.txt')
+    cookie_info = "✅ موجود" if cookies_ok else "❌ غير موجود"
+    rows = []
+    for p in platforms:
+        action = "وقف" if platform_enabled(p) else "شغّل"
+        rows.append([InlineKeyboardButton(f"{'🔴 ' if platform_enabled(p) else '🟢 '}{action} {p}",
+                                          callback_data=f"adm_toggle_{p}")])
+    rows.append([InlineKeyboardButton("🔄 تحديث", callback_data="adm_refresh"),
+                 InlineKeyboardButton("🍪 فحص كوكيز", callback_data="adm_cookies")])
+    try:
+        await q.edit_message_text(
+            f"⚙️ <b>لوحة تحكم المطور</b>\n\n"
+            f"<b>المنصات:</b>\n" + "\n".join(status_lines) + "\n\n"
+            f"<b>🍪 الكوكيز:</b> {cookie_info}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+    except: pass
+
 async def welcome_handler(upd, ctx):
     for m in upd.message.new_chat_members:
         if m.id == ctx.bot.id:
@@ -1972,25 +2229,54 @@ async def handle_msg(upd, ctx):
 
 async def _keep_alive(app):
     """يمنع Render من تنويم البوت — ping كل 10 دقائق"""
-    import aiohttp
-    url = os.environ.get('RENDER_EXTERNAL_URL', '')
+    url = os.environ.get('RENDER_EXTERNAL_URL', '').strip()
     if not url:
-        return  # مو على Render، ما نحتاجه
+        logger.info("ℹ️ RENDER_EXTERNAL_URL not set — keep_alive disabled")
+        return
+    logger.info(f"✅ keep_alive started → {url}")
     while True:
+        await asyncio.sleep(600)  # 10 دقائق
         try:
-            async with aiohttp.ClientSession() as s:
-                await s.get(url, timeout=aiohttp.ClientTimeout(total=10))
-        except: pass
-        await asyncio.sleep(600)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: requests.get(url, timeout=15)
+            )
+            logger.info("[keep_alive] ping OK")
+        except Exception as e:
+            logger.warning(f"[keep_alive] ping failed: {e}")
+
+def _start_health_server():
+    """سيرفر HTTP بسيط لـ Render health check على port 10000"""
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK - Bot is running!")
+        def log_message(self, *a): pass  # أوقف logs الـ HTTP
+    port = int(os.environ.get('PORT', 10000))
+    try:
+        srv = HTTPServer(('0.0.0.0', port), _H)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        logger.info(f"✅ Health server started on port {port}")
+    except Exception as e:
+        logger.warning(f"⚠️ Health server failed: {e}")
 
 def main():
-    token = os.environ.get("BOT_TOKEN")
+    token = os.environ.get("BOT_TOKEN", "")
+    if not token:
+        logger.error("❌ BOT_TOKEN not set! Add it as environment variable.")
+        return
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start",cmd_start))
+    app.add_handler(CommandHandler("admin",cmd_admin))
     app.add_handler(CommandHandler("help",cmd_help))
     app.add_handler(CommandHandler("ping",cmd_ping))
     app.add_handler(CommandHandler("id",cmd_id))
-    app.add_handler(CallbackQueryHandler(btn_cb,pattern=r"^(show_w_|cmd_|dl_|ttt_|convert_)"))
+    app.add_handler(CallbackQueryHandler(btn_cb,pattern=r"^(show_w_|cmd_|dl_|ttt_|convert_|ist_)"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS,welcome_handler))
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.TEXT,edit_handler))
     # تحويل الفيديو المُرسل مباشرة بالخاص
@@ -2014,9 +2300,12 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,track_msg), group=1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_msg), group=2)
     logger.info("🚀 Bot started!")
-    # شغّل keep_alive لـ Render
-    loop = asyncio.get_event_loop()
-    loop.create_task(_keep_alive(app))
+    # شغّل HTTP health server لـ Render
+    _start_health_server()
+    # شغّل keep_alive
+    async def _post_init(app):
+        asyncio.create_task(_keep_alive(app))
+    app.post_init = _post_init
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
