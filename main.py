@@ -756,8 +756,59 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
     if has_cookies: base_opts['cookiefile'] = 'cookies.txt'
     use_playlist = download_all or not is_story
 
+    def _scrape_page_json(page_url):
+        """
+        استخراج بيانات المنشور مباشرة من صفحة HTML الانستغرام (بديل عن yt-dlp
+        عندما يفشل بخطأ 'No video formats found' — شائع لبوستات /p/ الصور).
+        نبحث عن __additional_data أو shared_data المضمّنة بالصفحة.
+        """
+        try:
+            headers = {
+                'User-Agent': ua,
+                'Accept-Language': 'en-US,en;q=0.9',
+            }
+            cookies = {}
+            if has_cookies:
+                try:
+                    with open('cookies.txt', 'r') as cf:
+                        for line in cf:
+                            if line.startswith('#') or '\t' not in line: continue
+                            parts = line.strip().split('\t')
+                            if len(parts) >= 7 and 'instagram.com' in parts[0]:
+                                cookies[parts[5]] = parts[6]
+                except: pass
+            r = requests.get(page_url, headers=headers, cookies=cookies, timeout=20)
+            html = r.text
+
+            image_urls = []
+            audio_url = None
+            acc_name = username
+
+            # حاول ألقط اسم الحساب من og:title أو meta
+            m = re.search(r'"owner":\s*{\s*"username":\s*"([^"]+)"', html)
+            if m: acc_name = m.group(1)
+            if not acc_name:
+                m2 = re.search(r'"username"\s*:\s*"([^"]+)"', html)
+                if m2: acc_name = m2.group(1)
+
+            # جرب نمط display_url (صورة رئيسية) و edge_sidecar (كاروسيل)
+            for match in re.finditer(r'"display_url":"([^"]+)"', html):
+                u = match.group(1).encode().decode('unicode_escape')
+                image_urls.append(u)
+
+            # فيديو داخل بوست صور أحياناً يكون فيه clip صوتي فقط
+            vid_match = re.search(r'"video_url":"([^"]+)"', html)
+            if vid_match:
+                audio_url = vid_match.group(1).encode().decode('unicode_escape')
+
+            image_urls = list(dict.fromkeys(image_urls))
+            return image_urls, audio_url, acc_name
+        except Exception as e:
+            logger.warning(f"[Insta scrape] {e}")
+            return [], None, username
+
     def _extract_image_urls(info):
-        """استخرج روابط الصور من info object (يدعم /p/ carousel)"""
+        """استخرج روابط الصور من info object (يدعم /p/ carousel) — يُستخدم لو yt-dlp نجح"""
         urls = []
         if not info: return urls
         entries = info.get('entries') or []
@@ -787,7 +838,6 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
         return list(dict.fromkeys(urls))
 
     def _extract_audio_url(info):
-        """جيب رابط الصوت (موسيقى الخلفية) إن وجد لمنشورات الصور"""
         if not info: return None
         candidates = [info] + (info.get('entries') or [])
         for c in candidates:
@@ -803,8 +853,9 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
         image_urls_from_info = []
         audio_url = None
         is_photo_post = False
+        ytdlp_failed = False
 
-        # الخطوة 1: جلب المعلومات بدون تحميل
+        # الخطوة 1: جلب المعلومات عبر yt-dlp أولاً
         try:
             info_opts = {**base_opts, 'skip_download': True, 'noplaylist': not use_playlist}
             with YoutubeDL(info_opts) as ydl:
@@ -815,7 +866,6 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
                     title = acc_name or title
                     image_urls_from_info = _extract_image_urls(info)
                     audio_url = _extract_audio_url(info)
-                    # بوست صور خالص: كل entries بدون فيديو (_type == playlist وما فيه vcodec غير none)
                     entries = info.get('entries') or []
                     if entries:
                         has_real_video = any(
@@ -826,10 +876,21 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
                     elif not any(f.get('vcodec', 'none') != 'none' for f in info.get('formats', [])):
                         is_photo_post = True
         except Exception as e:
-            logger.warning(f"[Insta info] {e}")
+            logger.warning(f"[Insta info yt-dlp] {e}")
+            ytdlp_failed = True
 
-        # الخطوة 2: محاولة تحميل الفيديو (فقط لو مو بوست صور خالص)
-        if not is_photo_post:
+        # الخطوة 1ب: إذا yt-dlp فشل تماماً (No video formats found وشبهه) — استخدم الـ scraper المباشر
+        if ytdlp_failed or not image_urls_from_info:
+            scraped_imgs, scraped_audio, scraped_name = _scrape_page_json(url)
+            if scraped_imgs:
+                image_urls_from_info = scraped_imgs
+                is_photo_post = True
+                title = scraped_name or title
+                if not audio_url:
+                    audio_url = scraped_audio
+
+        # الخطوة 2: محاولة تحميل الفيديو (فقط لو مو بوست صور خالص ولم يفشل yt-dlp)
+        if not is_photo_post and not ytdlp_failed:
             for fmt_opts in [
                 {'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
                  'merge_output_format': 'mp4', 'noplaylist': not use_playlist},
@@ -844,7 +905,7 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
                 except Exception as e:
                     logger.warning(f"[Insta video dl] {e}")
 
-        # الخطوة 3: تحميل الصور من الروابط مباشرة (يشتغل للبوست وللستوري)
+        # الخطوة 3: تحميل الصور من الروابط مباشرة
         if image_urls_from_info:
             hdrs = {'User-Agent': ua, 'Referer': 'https://www.instagram.com/'}
             for idx, img_url in enumerate(image_urls_from_info[:20]):
@@ -861,14 +922,15 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
                 except Exception as e:
                     logger.warning(f"[Insta img dl] {e}")
 
-        # الخطوة 4: تحميل الصوت المستقل (موسيقى بوست الصور) — اسم الملف = اسم الحساب
+        # الخطوة 4: تحميل الصوت المستقل — اسم الملف = اسم الحساب
         audio_path = None
         if is_photo_post and audio_url:
             try:
                 r = requests.get(audio_url, headers={'User-Agent': ua}, timeout=25)
                 if r.status_code == 200 and len(r.content) > 2000:
                     safe_name = re.sub(r'[^\w\-]', '_', title or username or 'audio')[:50]
-                    audio_path = os.path.join(tmp, f'{safe_name}.m4a')
+                    ext = 'mp4' if '.mp4' in audio_url else 'm4a'
+                    audio_path = os.path.join(tmp, f'{safe_name}.{ext}')
                     with open(audio_path, 'wb') as f:
                         f.write(r.content)
             except Exception as e:
