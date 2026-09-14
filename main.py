@@ -539,6 +539,10 @@ async def auto_download(upd, ctx, url, cid, platform="🎬", max_height=1440):
     )
     opts['format_sort'] = [f'res:{max_height}', '+codec:h264', 'ext:mp4']
     opts['merge_output_format'] = 'mp4'
+    # أجبر أي ملف غير mp4 على التحويل لـ mp4 حتى يرسله تيليقرام كفيديو دائماً
+    opts['postprocessors'] = opts.get('postprocessors', []) + [
+        {'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}
+    ]
 
     active_dl[msg.message_id] = "0%"
     prog_task = asyncio.create_task(
@@ -548,11 +552,17 @@ async def auto_download(upd, ctx, url, cid, platform="🎬", max_height=1440):
     def _run():
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
+            # فضّل ملفات mp4 دائماً؛ إذا ما فيه، خذ أي فيديو موجود
             files = sorted(
-                [os.path.join(tmp, f) for f in os.listdir(tmp)
-                 if f.endswith(('.mp4', '.webm', '.mkv'))],
+                [os.path.join(tmp, f) for f in os.listdir(tmp) if f.endswith('.mp4')],
                 key=os.path.getsize, reverse=True
             )
+            if not files:
+                files = sorted(
+                    [os.path.join(tmp, f) for f in os.listdir(tmp)
+                     if f.endswith(('.webm', '.mkv'))],
+                    key=os.path.getsize, reverse=True
+                )
             return files[0] if files else None, info.get('title', '')
 
     try:
@@ -560,9 +570,12 @@ async def auto_download(upd, ctx, url, cid, platform="🎬", max_height=1440):
         active_dl.pop(msg.message_id, None); prog_task.cancel()
         if fp and os.path.exists(fp):
             await wm.edit_text("📤 جاري الرفع...")
+            safe_title = re.sub(r'[^\w\-]', '_', (title or platform))[:60] or 'video'
+            fname = f"{safe_title}.mp4"
             with open(fp, 'rb') as f:
                 await ctx.bot.send_video(
                     cid, f,
+                    filename=fname,
                     caption=f"{platform} {title[:60]}" if title else platform,
                     supports_streaming=True
                 )
@@ -656,7 +669,13 @@ async def tiktok_handler(upd, ctx, url, cid, reply_id):
                         await ctx.bot.send_media_group(cid, media, reply_to_message_id=reply_id)
                         if i+10 < total: await asyncio.sleep(1)
                     if data.get('music'):
-                        await ctx.bot.send_audio(cid, data['music'], caption=f"{cap}\n🖼 {total} صورة", parse_mode="HTML")
+                        author_name = data.get('author', 'audio')
+                        await ctx.bot.send_audio(
+                            cid, data['music'],
+                            title=author_name,
+                            performer=author_name,
+                            caption=f"{cap}\n🖼 {total} صورة", parse_mode="HTML"
+                        )
                 else:
                     return await wm.edit_text("❌ تعذر تحميل الصور من هذه الألبوم.")
             else:
@@ -724,7 +743,7 @@ async def tiktok_handler(upd, ctx, url, cid, reply_id):
     if tmp: shutil.rmtree(tmp, ignore_errors=True)
 
 async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=False, is_story=False):
-    """تحميل انستغرام — فيديو + صور ثابتة + ستوريات + كاروسيل"""
+    """تحميل انستغرام — فيديو + صور ثابتة + ستوريات + كاروسيل (بوستات /p/)"""
     has_cookies = os.path.exists('cookies.txt')
     tmp = tempfile.mkdtemp()
     ua = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
@@ -738,59 +757,94 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
     use_playlist = download_all or not is_story
 
     def _extract_image_urls(info):
-        """استخرج روابط الصور من info object"""
+        """استخرج روابط الصور من info object (يدعم /p/ carousel)"""
         urls = []
         if not info: return urls
-        # كاروسيل (entries)
         entries = info.get('entries') or []
         if entries:
             for e in entries:
-                if e.get('thumbnail'): urls.append(e['thumbnail'])
-                # لو عنده formats وكلها صور
+                got = False
                 for f in e.get('formats', []):
-                    if f.get('ext') in ('jpg','jpeg','png','webp') or                        (f.get('url') and any(x in f.get('url','') for x in ('jpg','jpeg','png','webp','cdninstagram'))):
-                        urls.append(f['url'])
+                    fu = f.get('url', '')
+                    if f.get('ext') in ('jpg', 'jpeg', 'png', 'webp') or \
+                       (fu and any(x in fu for x in ('jpg', 'jpeg', 'png', 'webp', 'cdninstagram')) and '.mp4' not in fu):
+                        urls.append(fu)
+                        got = True
                         break
+                if not got and e.get('thumbnail'):
+                    urls.append(e['thumbnail'])
         else:
-            if info.get('thumbnail'): urls.append(info['thumbnail'])
+            got = False
             for f in info.get('formats', []):
-                if f.get('ext') in ('jpg','jpeg','png','webp') or                    (f.get('url') and 'cdninstagram' in f.get('url','')):
-                    urls.append(f['url'])
+                fu = f.get('url', '')
+                if f.get('ext') in ('jpg', 'jpeg', 'png', 'webp') or \
+                   (fu and 'cdninstagram' in fu and '.mp4' not in fu):
+                    urls.append(fu)
+                    got = True
                     break
-        return list(dict.fromkeys(urls))  # أزل التكرار
+            if not got and info.get('thumbnail'):
+                urls.append(info['thumbnail'])
+        return list(dict.fromkeys(urls))
+
+    def _extract_audio_url(info):
+        """جيب رابط الصوت (موسيقى الخلفية) إن وجد لمنشورات الصور"""
+        if not info: return None
+        candidates = [info] + (info.get('entries') or [])
+        for c in candidates:
+            for f in c.get('formats', []):
+                acodec = f.get('acodec', 'none')
+                vcodec = f.get('vcodec', 'none')
+                if acodec != 'none' and vcodec == 'none':
+                    return f.get('url')
+        return None
 
     def _dl():
         title = username or 'انستغرام'
         image_urls_from_info = []
+        audio_url = None
+        is_photo_post = False
 
-        # الخطوة 1: جلب المعلومات بدون تحميل لاستخراج روابط الصور
+        # الخطوة 1: جلب المعلومات بدون تحميل
         try:
             info_opts = {**base_opts, 'skip_download': True, 'noplaylist': not use_playlist}
             with YoutubeDL(info_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 if info:
-                    title = info.get('title', title)
+                    acc_name = (info.get('uploader') or info.get('channel') or
+                                info.get('uploader_id') or title)
+                    title = acc_name or title
                     image_urls_from_info = _extract_image_urls(info)
+                    audio_url = _extract_audio_url(info)
+                    # بوست صور خالص: كل entries بدون فيديو (_type == playlist وما فيه vcodec غير none)
+                    entries = info.get('entries') or []
+                    if entries:
+                        has_real_video = any(
+                            any(f.get('vcodec', 'none') != 'none' and f.get('ext') == 'mp4' for f in e.get('formats', []))
+                            for e in entries
+                        )
+                        is_photo_post = not has_real_video
+                    elif not any(f.get('vcodec', 'none') != 'none' for f in info.get('formats', [])):
+                        is_photo_post = True
         except Exception as e:
             logger.warning(f"[Insta info] {e}")
 
-        # الخطوة 2: محاولة تحميل الفيديو
-        for fmt_opts in [
-            {'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-             'merge_output_format': 'mp4', 'noplaylist': not use_playlist},
-            {'format': 'best[ext=mp4]/best', 'noplaylist': not use_playlist},
-        ]:
-            try:
-                opts = {**base_opts, **fmt_opts}
-                with YoutubeDL(opts) as ydl:
-                    ydl.extract_info(url, download=True)
-                if any(f.endswith(('.mp4','.webm','.mkv')) for f in os.listdir(tmp)):
-                    break
-            except Exception as e:
-                logger.warning(f"[Insta video dl] {e}")
+        # الخطوة 2: محاولة تحميل الفيديو (فقط لو مو بوست صور خالص)
+        if not is_photo_post:
+            for fmt_opts in [
+                {'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                 'merge_output_format': 'mp4', 'noplaylist': not use_playlist},
+                {'format': 'best[ext=mp4]/best', 'noplaylist': not use_playlist},
+            ]:
+                try:
+                    opts = {**base_opts, **fmt_opts}
+                    with YoutubeDL(opts) as ydl:
+                        ydl.extract_info(url, download=True)
+                    if any(f.endswith(('.mp4', '.webm', '.mkv')) for f in os.listdir(tmp)):
+                        break
+                except Exception as e:
+                    logger.warning(f"[Insta video dl] {e}")
 
-        # الخطوة 3: تحميل الصور من الروابط مباشرة
-        downloaded_imgs = []
+        # الخطوة 3: تحميل الصور من الروابط مباشرة (يشتغل للبوست وللستوري)
         if image_urls_from_info:
             hdrs = {'User-Agent': ua, 'Referer': 'https://www.instagram.com/'}
             for idx, img_url in enumerate(image_urls_from_info[:20]):
@@ -804,61 +858,74 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
                         fpath = os.path.join(tmp, f'img_{idx:03d}.{ext}')
                         with open(fpath, 'wb') as f:
                             f.write(r.content)
-                        downloaded_imgs.append(fpath)
                 except Exception as e:
                     logger.warning(f"[Insta img dl] {e}")
 
-        all_files = [os.path.join(tmp,f) for f in os.listdir(tmp) if os.path.isfile(os.path.join(tmp,f))]
+        # الخطوة 4: تحميل الصوت المستقل (موسيقى بوست الصور) — اسم الملف = اسم الحساب
+        audio_path = None
+        if is_photo_post and audio_url:
+            try:
+                r = requests.get(audio_url, headers={'User-Agent': ua}, timeout=25)
+                if r.status_code == 200 and len(r.content) > 2000:
+                    safe_name = re.sub(r'[^\w\-]', '_', title or username or 'audio')[:50]
+                    audio_path = os.path.join(tmp, f'{safe_name}.m4a')
+                    with open(audio_path, 'wb') as f:
+                        f.write(r.content)
+            except Exception as e:
+                logger.warning(f"[Insta audio dl] {e}")
+
+        all_files = [os.path.join(tmp, f) for f in os.listdir(tmp) if os.path.isfile(os.path.join(tmp, f))]
         videos = sorted(
-            [f for f in all_files if f.endswith(('.mp4','.webm','.mkv'))],
+            [f for f in all_files if f.endswith(('.mp4', '.webm', '.mkv')) and f != audio_path],
             key=os.path.getsize, reverse=True
         )
         video_stems = {os.path.splitext(v)[0] for v in videos}
         images = sorted(
             [f for f in all_files
-             if f.endswith(('.jpg','.jpeg','.png','.webp'))
+             if f.endswith(('.jpg', '.jpeg', '.png', '.webp'))
              and os.path.getsize(f) > 3000
              and os.path.splitext(f)[0] not in video_stems],
             key=os.path.getsize, reverse=True
         )
-        return videos, images, title
+        return videos, images, title, audio_path
 
-    async def _send(videos, images, title):
+    async def _send(videos, images, title, audio_path):
         await wm.edit_text(f"📤 جاري الرفع...")
-        sent = 0
         for v in videos[:5]:
-            if os.path.getsize(v) < 50*1024*1024:
-                with open(v,'rb') as f:
+            if os.path.getsize(v) < 50 * 1024 * 1024:
+                with open(v, 'rb') as f:
                     await ctx.bot.send_video(cid, f, caption=f"📸 {title[:60]}", supports_streaming=True)
-                sent += 1
         if images:
-            for i in range(0, min(len(images),20), 10):
-                batch = images[i:i+10]
+            for i in range(0, min(len(images), 20), 10):
+                batch = images[i:i + 10]
                 if len(batch) == 1:
-                    with open(batch[0],'rb') as f:
+                    with open(batch[0], 'rb') as f:
                         await ctx.bot.send_photo(cid, f, caption=f"📸 {title[:60]}")
                 else:
-                    handles=[]; grp=[]
+                    handles = []; grp = []
                     for img in batch:
-                        fh=open(img,'rb'); handles.append(fh)
+                        fh = open(img, 'rb'); handles.append(fh)
                         grp.append(InputMediaPhoto(fh))
                     try: await ctx.bot.send_media_group(cid, grp)
                     finally:
                         for fh in handles: fh.close()
-                sent += len(batch)
-                if i+10 < len(images): await asyncio.sleep(1)
+                if i + 10 < len(images): await asyncio.sleep(1)
+        if audio_path and os.path.exists(audio_path):
+            perf_name = username or title or 'Instagram'
+            with open(audio_path, 'rb') as f:
+                await ctx.bot.send_audio(cid, f, title=perf_name, performer=perf_name)
         await wm.delete()
 
     try:
-        videos, images, title = await asyncio.get_running_loop().run_in_executor(None, _dl)
-        if not videos and not images:
+        videos, images, title, audio_path = await asyncio.get_running_loop().run_in_executor(None, _dl)
+        if not videos and not images and not audio_path:
             await wm.edit_text(
                 "❌ ما لقيت محتوى.\n"
                 + ("• أضف كوكيز انستغرام للمحتوى الخاص\n" if not has_cookies else "")
                 + "• تأكد أن الحساب عام"
             )
             return
-        await _send(videos, images, title)
+        await _send(videos, images, title, audio_path)
     except Exception as e:
         err = str(e)
         logger.error(f"[Insta] {err}")
@@ -870,7 +937,6 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
             await wm.edit_text(f"❌ فشل: {err[:120]}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-
 
 async def insta_handler(upd, ctx, url, cid):
     """انستغرام — ريلز + صور + ستوريات"""
@@ -1127,176 +1193,160 @@ async def spotify_handler(upd, ctx, url, cid):
 
 
 async def tiktok_user_info(upd, ctx, username, cid):
-    """معلومات حساب تيك توك"""
+    """معلومات حساب تيك توك — بأسلوب بطاقة (اسم/يوزر/صورة/ID) مثل بطاقة مستخدم جديد"""
     msg = upd.message
-
     username = username.lstrip('@').strip()
 
     if not username:
-
         return await msg.reply_text("❗ مثال: <code>تيك codexpert</code>", parse_mode="HTML")
 
     wm = await msg.reply_text(f"🔍 جاري جلب معلومات @{username}...")
 
-
-
     COUNTRY_FLAG = {
-
         'IQ':'🇮🇶','SA':'🇸🇦','US':'🇺🇸','GB':'🇬🇧','AE':'🇦🇪','EG':'🇪🇬',
-
         'TR':'🇹🇷','IR':'🇮🇷','RU':'🇷🇺','DE':'🇩🇪','FR':'🇫🇷','IN':'🇮🇳',
-
         'CN':'🇨🇳','JP':'🇯🇵','KR':'🇰🇷','BR':'🇧🇷','KW':'🇰🇼','QA':'🇶🇦',
-
         'BH':'🇧🇭','OM':'🇴🇲','JO':'🇯🇴','SY':'🇸🇾','LB':'🇱🇧','YE':'🇾🇪',
-
         'LY':'🇱🇾','TN':'🇹🇳','DZ':'🇩🇿','MA':'🇲🇦','SD':'🇸🇩','PK':'🇵🇰',
-
     }
 
+    def _fetch_tikwm():
+        """محاولة عبر tikwm (endpoints متعددة، بعضها معطّل حالياً فنجرب أكثر من واحد)"""
+        endpoints = [
+            f"https://www.tikwm.com/api/user/info?unique_id={username}&count=1",
+            f"https://tikwm.com/api/user/info?unique_id={username}",
+            f"https://www.tikwm.com/api/user/info/?unique_id={username}",
+        ]
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0",
+            "Referer": "https://www.tikwm.com/",
+            "Accept": "application/json",
+        }
+        for ep in endpoints:
+            try:
+                r = requests.get(ep, headers=headers, timeout=20)
+                data = r.json()
+                if data.get('code') == 0 and data.get('data'):
+                    return data
+            except Exception as e:
+                logger.warning(f"[TT info tikwm] {ep}: {e}")
+                continue
+        return None
 
+    def _fetch_ytdlp():
+        """fallback: استخدم yt-dlp لجلب أول فيديو من صفحة المستخدم واستخراج بياناته"""
+        try:
+            opts = {
+                'quiet': True, 'nocheckcertificate': True, 'geo_bypass': True,
+                'skip_download': True, 'playlist_items': '1',
+                'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0'},
+            }
+            if os.path.exists('cookies.txt'): opts['cookiefile'] = 'cookies.txt'
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"https://www.tiktok.com/@{username}", download=False)
+                entry = info
+                if info and info.get('entries'):
+                    ents = list(info['entries'])
+                    entry = ents[0] if ents else info
+                if not entry: return None
+                uploader = entry.get('uploader') or username
+                return {
+                    'code': 0,
+                    'data': {
+                        'user': {
+                            'nickname': entry.get('uploader') or username,
+                            'id': entry.get('uploader_id') or entry.get('channel_id') or '',
+                            'signature': entry.get('description', '') or '',
+                            'avatarLarger': entry.get('uploader_url', '') and entry.get('thumbnail', ''),
+                            'avatarThumb': entry.get('thumbnail', ''),
+                            'verified': False,
+                        },
+                        'stats': {
+                            'followerCount': entry.get('channel_follower_count') or 0,
+                        }
+                    }
+                }
+        except Exception as e:
+            logger.warning(f"[TT info yt-dlp fallback] {e}")
+            return None
 
     def _fetch():
-
-        endpoints = [
-
-            f"https://www.tikwm.com/api/user/info?unique_id={username}&count=1",
-
-            f"https://tikwm.com/api/user/info?unique_id={username}",
-
-        ]
-
-        headers = {
-
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0",
-
-            "Referer": "https://www.tikwm.com/",
-
-            "Accept": "application/json",
-
-        }
-
-        for ep in endpoints:
-
-            try:
-
-                r = requests.get(ep, headers=headers, timeout=20)
-
-                data = r.json()
-
-                if data.get('code') == 0:
-
-                    return data
-
-            except: continue
-
-        return {}
-
-
+        data = _fetch_tikwm()
+        if data: return data, 'tikwm'
+        data = _fetch_ytdlp()
+        if data: return data, 'ytdlp'
+        return None, None
 
     try:
+        data, source = await asyncio.get_running_loop().run_in_executor(None, _fetch)
 
-        data = await asyncio.get_running_loop().run_in_executor(None, _fetch)
-
-        if data.get('code') == 0 and data.get('data'):
-
-            d = data['data']
-
-            u = d.get('user', d)
-
-            stats = d.get('stats', u)
-
-            name = u.get('nickname') or u.get('name', username)
-
-            uid_str = str(u.get('id', '—'))
-
-            followers = (stats.get('followerCount') or u.get('followerCount') or d.get('fans') or 0)
-
-            following = (stats.get('followingCount') or u.get('followingCount') or d.get('following') or 0)
-
-            likes = (stats.get('heartCount') or u.get('heartCount') or stats.get('diggCount') or d.get('heart') or 0)
-
-            videos = (stats.get('videoCount') or u.get('videoCount') or d.get('video') or 0)
-
-            bio = u.get('signature','') or '—'
-
-            verified = "✅ موثق" if (u.get('verified') or u.get('isVerified')) else "❌ غير موثق"
-
-            private = "🔒 خاص" if (u.get('privateAccount') or u.get('secret')) else "🌐 عام"
-
-            avatar = u.get('avatarLarger') or u.get('avatarMedium') or u.get('avatarThumb') or u.get('avatar','')
-
-            region = (u.get('region') or u.get('location') or '').upper()
-
-            country_str = f"{COUNTRY_FLAG.get(region,'🌍')} {region}" if region else "🌍 غير معروف"
-
-            create_ts = u.get('createTime') or u.get('createtime') or 0
-
-            joined_str = ""
-
-            if create_ts:
-
-                try:
-
-                    import datetime
-
-                    joined_str = "\n📅 <b>تاريخ الانضمام:</b> " + datetime.datetime.fromtimestamp(int(create_ts)).strftime('%Y/%m/%d')
-
-                except: pass
-
-            txt = (
-
-                f"🎵 <b>معلومات تيك توك</b>\n\n"
-
-                f"👤 <b>الاسم:</b> {name}\n"
-
-                f"📛 <b>اليوزر:</b> @{username}\n"
-
-                f"🆔 <b>ID:</b> <code>{uid_str}</code>\n"
-
-                f"🌍 <b>الدولة:</b> {country_str}\n"
-
-                f"✅ <b>التوثيق:</b> {verified}\n"
-
-                f"🔒 <b>الحساب:</b> {private}\n"
-
-                f"👥 <b>المتابعون:</b> {followers:,}\n"
-
-                f"➡️ <b>يتابع:</b> {following:,}\n"
-
-                f"❤️ <b>الإعجابات:</b> {likes:,}\n"
-
-                f"🎬 <b>الفيديوهات:</b> {videos:,}\n"
-
-                f"📝 <b>البايو:</b> {bio[:150]}"
-
-                f"{joined_str}\n\n"
-
-                f"🔗 <a href='https://www.tiktok.com/@{username}'>فتح الحساب</a>"
-
+        if not data or not data.get('data'):
+            await wm.edit_text(
+                f"❌ ما لقيت حساب @{username}.\n"
+                "تأكد من اليوزرنيم."
             )
+            return
 
-            await wm.delete()
+        d = data['data']
+        u = d.get('user', d)
+        stats = d.get('stats', u)
 
-            if avatar:
+        name = u.get('nickname') or u.get('name') or username
+        uid_str = str(u.get('id', '—')) or '—'
+        followers = (stats.get('followerCount') or u.get('followerCount') or d.get('fans') or 0)
+        following = (stats.get('followingCount') or u.get('followingCount') or d.get('following') or 0)
+        likes = (stats.get('heartCount') or u.get('heartCount') or stats.get('diggCount') or d.get('heart') or 0)
+        videos_count = (stats.get('videoCount') or u.get('videoCount') or d.get('video') or 0)
+        bio = u.get('signature', '') or '—'
+        verified = "✅ موثق" if (u.get('verified') or u.get('isVerified')) else "❌ غير موثق"
+        private = "🔒 خاص" if (u.get('privateAccount') or u.get('secret')) else "🌐 عام"
+        avatar = u.get('avatarLarger') or u.get('avatarMedium') or u.get('avatarThumb') or u.get('avatar', '')
+        region = (u.get('region') or u.get('location') or '').upper()
+        country_str = f"{COUNTRY_FLAG.get(region, '🌍')} {region}" if region else "🌍 غير معروف"
 
-                try:
+        create_ts = u.get('createTime') or u.get('createtime') or 0
+        joined_str = ""
+        if create_ts:
+            try:
+                import datetime
+                joined_str = "\n📅 <b>تاريخ الانضمام:</b> " + datetime.datetime.fromtimestamp(int(create_ts)).strftime('%Y/%m/%d')
+            except: pass
 
-                    await ctx.bot.send_photo(cid, avatar, caption=txt, parse_mode="HTML")
+        # بطاقة على طراز "مستخدم جديد": الاسم، اليوزر، الصورة، الـ ID بارزين بالأعلى
+        txt = (
+            f"🆕 <b>بطاقة مستخدم تيك توك</b>\n\n"
+            f"👤 <b>الاسم:</b> {name}\n"
+            f"📛 <b>اليوزر:</b> @{username}\n"
+            f"🆔 <b>الآيدي:</b> <code>{uid_str}</code>\n"
+            f"───────────────\n"
+            f"🌍 <b>الدولة:</b> {country_str}\n"
+            f"✅ <b>التوثيق:</b> {verified}\n"
+            f"🔒 <b>الحساب:</b> {private}\n"
+            f"👥 <b>المتابعون:</b> {followers:,}\n"
+            f"➡️ <b>يتابع:</b> {following:,}\n"
+            f"❤️ <b>الإعجابات:</b> {likes:,}\n"
+            f"🎬 <b>الفيديوهات:</b> {videos_count:,}\n"
+            f"📝 <b>البايو:</b> {bio[:150]}"
+            f"{joined_str}\n\n"
+            f"🔗 <a href='https://www.tiktok.com/@{username}'>فتح الحساب</a>"
+        )
+        if source == 'ytdlp':
+            txt += "\n\n<i>ℹ️ بعض الإحصائيات قد تكون غير مكتملة (مصدر بديل)</i>"
 
-                    return
+        await wm.delete()
+        if avatar:
+            try:
+                await ctx.bot.send_photo(cid, avatar, caption=txt, parse_mode="HTML")
+                return
+            except Exception as e:
+                logger.warning(f"[TT info avatar] {e}")
+        await msg.reply_text(txt, parse_mode="HTML")
 
-                except: pass
-
-            await msg.reply_text(txt, parse_mode="HTML")
-
-        else:
-
-            await wm.edit_text(f"❌ ما لقيت حساب @{username}.\nتأكد من اليوزرنيم.")
     except Exception as e:
         logger.error(f"[TT info] {e}")
         await wm.edit_text(f"❌ خطأ: {str(e)[:100]}")
-        
+
+
 async def cmd_admin(upd, ctx):
     """لوحة تحكم المطور — للمطور فقط"""
     msg = upd.message
@@ -1760,8 +1810,16 @@ async def welcome_handler(upd, ctx):
         if m.is_bot: continue
         s=get_settings(upd.message.chat.id)
         if not s.get("welcome",True): continue
-        name=f'<a href="tg://user?id={m.id}">{m.first_name}</a>'
-        txt=f"👋 أهلاً {name} في المجموعة! 🎉\nنتمنى لك وقتاً ممتعاً 😊"
+        name=f'<a href="tg://user?id={m.id}">{m.first_name} {m.last_name or ""}</a>'.strip()
+        uname = f"@{m.username}" if m.username else "لا يوجد"
+        # بطاقة مستخدم جديد: الاسم، اليوزر، الآيدي بشكل بارز
+        txt = (
+            f"🆕 <b>مستخدم جديد!</b>\n\n"
+            f"👤 <b>الاسم:</b> {name}\n"
+            f"📛 <b>اليوزر:</b> {uname}\n"
+            f"🆔 <b>الآيدي:</b> <code>{m.id}</code>\n\n"
+            f"🎉 أهلاً وسهلاً بيك بالمجموعة!"
+        )
         try:
             p=await ctx.bot.get_user_profile_photos(m.id,limit=1)
             if p.total_count>0: await ctx.bot.send_photo(upd.message.chat.id,p.photos[0][-1].file_id,caption=txt,parse_mode="HTML")
