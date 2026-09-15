@@ -42,6 +42,42 @@ def is_dev(user) -> bool:
 def platform_enabled(name: str) -> bool:
     return name not in _DISABLED_PLATFORMS
 
+async def send_error(ctx, chat_id, user, dev_msg: str, user_msg: str = "❌ حدث خطأ، حاول مرة أخرى لاحقاً.",
+                      target_message=None, parse_mode="HTML"):
+    """
+    رسالة خطأ موحّدة بنوعين:
+    - للمطور (@snh_1): يشوف dev_msg (تفصيلي بنوع الخطأ)
+    - لبقية المستخدمين: يشوف user_msg (بسيط) وتنحذف تلقائياً بعد 30 ثانية
+
+    target_message: إذا فيه رسالة "جاري التحميل..." موجودة، نعدّلها بدل إرسال رسالة جديدة.
+    """
+    is_developer = is_dev(user) if user else False
+    final_text = dev_msg if is_developer else user_msg
+
+    sent_msg = None
+    try:
+        if target_message is not None:
+            try:
+                await target_message.edit_text(final_text, parse_mode=parse_mode)
+                sent_msg = target_message
+            except Exception:
+                sent_msg = await ctx.bot.send_message(chat_id, final_text, parse_mode=parse_mode)
+        else:
+            sent_msg = await ctx.bot.send_message(chat_id, final_text, parse_mode=parse_mode)
+    except Exception as e:
+        logger.error(f"[send_error] failed to send: {e}")
+        return
+
+    # حذف تلقائي بعد 30 ثانية فقط لرسائل المستخدمين العاديين
+    if not is_developer and sent_msg is not None:
+        async def _auto_delete():
+            await asyncio.sleep(30)
+            try:
+                await ctx.bot.delete_message(chat_id, sent_msg.message_id)
+            except Exception:
+                pass
+        asyncio.create_task(_auto_delete())
+
 LANG_FLAG = {
     'ar':'🇸🇦','en':'🇬🇧','tr':'🇹🇷','fa':'🇮🇷','ru':'🇷🇺',
     'fr':'🇫🇷','de':'🇩🇪','es':'🇪🇸','hi':'🇮🇳','zh':'🇨🇳',
@@ -482,17 +518,12 @@ async def yt_handler(upd, ctx, url, uid):
 
     info, last_err = await asyncio.get_running_loop().run_in_executor(None, _get_info)
     if not info:
-        if dev:
-            await wm.edit_text(
-                f"⚙️ <b>[DEV] فشل يوتيوب</b>\n<code>{last_err[:300]}</code>",
-                parse_mode="HTML"
-            )
-        else:
-            await wm.edit_text(
-                "❌ تعذر جلب بيانات الفيديو.\n"
-                "• تأكد أن الرابط صحيح وعام\n"
-                "• حاول مرة ثانية بعد قليل"
-            )
+        await send_error(
+            ctx, msg.chat_id, msg.from_user,
+            dev_msg=f"⚙️ [DEV] فشل يوتيوب:\n<code>{(last_err or '')[:400]}</code>",
+            user_msg="❌ تعذر جلب بيانات الفيديو.\n• تأكد أن الرابط صحيح وعام\n• حاول مرة ثانية بعد قليل",
+            target_message=wm
+        )
         return
 
     format_map = {}
@@ -539,10 +570,6 @@ async def auto_download(upd, ctx, url, cid, platform="🎬", max_height=1440):
     )
     opts['format_sort'] = [f'res:{max_height}', '+codec:h264', 'ext:mp4']
     opts['merge_output_format'] = 'mp4'
-    # أجبر أي ملف غير mp4 على التحويل لـ mp4 حتى يرسله تيليقرام كفيديو دائماً
-    opts['postprocessors'] = opts.get('postprocessors', []) + [
-        {'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}
-    ]
 
     active_dl[msg.message_id] = "0%"
     prog_task = asyncio.create_task(
@@ -552,7 +579,6 @@ async def auto_download(upd, ctx, url, cid, platform="🎬", max_height=1440):
     def _run():
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            # فضّل ملفات mp4 دائماً؛ إذا ما فيه، خذ أي فيديو موجود
             files = sorted(
                 [os.path.join(tmp, f) for f in os.listdir(tmp) if f.endswith('.mp4')],
                 key=os.path.getsize, reverse=True
@@ -565,14 +591,57 @@ async def auto_download(upd, ctx, url, cid, platform="🎬", max_height=1440):
                 )
             return files[0] if files else None, info.get('title', '')
 
+    def _reencode_for_compatibility(src_path):
+        """
+        إعادة ترميز صريحة (مو مجرد remux) لضمان توافق تام مع مشغل
+        فيديو تيليقرام على iOS: H.264 (yuv420p) + AAC + moov atom بالمقدمة
+        (faststart) — هذا يحل مشكلة الفيديو الرمادي / اللي ما ينحفظ بالجهاز.
+        """
+        out_path = src_path.rsplit('.', 1)[0] + '_fixed.mp4'
+        cmd = [
+            FFMPEG, '-y', '-i', src_path,
+            '-c:v', 'libx264', '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart',
+            out_path
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            if result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+                return out_path, None
+            return None, result.stderr[-500:] if result.stderr else "فشل إعادة الترميز"
+        except subprocess.TimeoutExpired:
+            return None, "انتهى الوقت أثناء إعادة الترميز"
+        except Exception as e:
+            return None, str(e)
+
     try:
         fp, title = await asyncio.get_running_loop().run_in_executor(None, _run)
         active_dl.pop(msg.message_id, None); prog_task.cancel()
+
         if fp and os.path.exists(fp):
+            # أعد الترميز دائماً لضمان توافق H.264/AAC/faststart (يحل مشكلة الفيديو الرمادي بالآيفون)
+            fixed_fp, reencode_err = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: _reencode_for_compatibility(fp)
+            )
+            final_fp = fixed_fp if fixed_fp else fp
+            if reencode_err:
+                logger.warning(f"[auto_dl reencode] {reencode_err}")
+
+            file_size = os.path.getsize(final_fp)
+            if file_size < 1000:
+                await send_error(
+                    ctx, cid, msg.from_user,
+                    dev_msg=f"⚙️ [DEV] الملف الناتج فارغ تقريباً ({file_size} بايت) — {platform}",
+                    user_msg="❌ حدث خطأ أثناء التحميل، حاول مرة أخرى.",
+                    target_message=wm
+                )
+                return
+
             await wm.edit_text("📤 جاري الرفع...")
             safe_title = re.sub(r'[^\w\-]', '_', (title or platform))[:60] or 'video'
             fname = f"{safe_title}.mp4"
-            with open(fp, 'rb') as f:
+            with open(final_fp, 'rb') as f:
                 await ctx.bot.send_video(
                     cid, f,
                     filename=fname,
@@ -581,11 +650,21 @@ async def auto_download(upd, ctx, url, cid, platform="🎬", max_height=1440):
                 )
             await wm.delete()
         else:
-            await wm.edit_text("❌ فشل التحميل. تأكد أن الرابط عام.")
+            await send_error(
+                ctx, cid, msg.from_user,
+                dev_msg=f"⚙️ [DEV] {platform} فشل التحميل — لم يُنتج أي ملف من الرابط:\n<code>{url[:200]}</code>",
+                user_msg="❌ تعذر التحميل. تأكد أن الرابط عام وصحيح.",
+                target_message=wm
+            )
     except Exception as e:
         active_dl.pop(msg.message_id, None); prog_task.cancel()
         logger.error(f"[auto_dl] {e}")
-        await wm.edit_text(f"❌ فشل التحميل: {str(e)[:100]}")
+        await send_error(
+            ctx, cid, msg.from_user,
+            dev_msg=f"⚙️ [DEV] خطأ {platform}:\n<code>{str(e)[:400]}</code>",
+            user_msg="❌ حدث خطأ أثناء التحميل، حاول مرة أخرى لاحقاً.",
+            target_message=wm
+        )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -632,11 +711,21 @@ async def x_handler(upd, ctx, url, uid):
                 await ctx.bot.send_video(cid, f, caption=f"🐦 {title[:60]}" if title else "🐦 X", supports_streaming=True)
             await wm.delete()
         else:
-            hint = "\n💡 تأكد من الكوكيز أو أن التغريدة عامة" if not has_cookies else ""
-            await wm.edit_text(f"❌ فشل التحميل من X.{hint}")
+            await send_error(
+                ctx, cid, msg.from_user,
+                dev_msg=(f"⚙️ [DEV] X فشل — cookies={'موجودة' if has_cookies else 'غير موجودة'}\n"
+                         f"الرابط: <code>{url[:200]}</code>"),
+                user_msg="❌ تعذر التحميل من X. تأكد أن التغريدة عامة.",
+                target_message=wm
+            )
     except Exception as e:
         active_dl.pop(msg.message_id, None); prog.cancel()
-        await wm.edit_text(f"❌ خطأ: {str(e)[:80]}")
+        await send_error(
+            ctx, cid, msg.from_user,
+            dev_msg=f"⚙️ [DEV] خطأ X:\n<code>{str(e)[:400]}</code>",
+            user_msg="❌ حدث خطأ، حاول مرة أخرى لاحقاً.",
+            target_message=wm
+        )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -646,67 +735,97 @@ async def tiktok_handler(upd, ctx, url, cid, reply_id):
     # محاولة 1: tikwm API (يدعم تيك توك + دوين)
     data = await asyncio.get_running_loop().run_in_executor(None, lambda: tiktok_api(url))
     if data:
-        cap = f"👤 <b>@{data['author']}</b>"
+        author = data.get('author', 'tiktok')
+        cap = f"👤 <b>@{author}</b>"
         try:
             if data['type'] == 'images':
-                # تحميل الصور أولاً لأن روابطها تحتاج headers
-                def _dl_imgs():
-                    result = []
+                # تحميل الصور + الصوت (كملفات فعلية بايتات، مو روابط) — يضمن اسم ملف صحيح للصوت
+                def _dl_imgs_and_audio():
+                    imgs = []
+                    audio_bytes = None
                     headers = {'User-Agent':'Mozilla/5.0','Referer':'https://www.tiktok.com/'}
-                    for img_url in data['data']:  # كل الصور بدون حد
+                    for img_url in data['data']:
                         try:
                             r = requests.get(img_url, headers=headers, timeout=15)
-                            if r.status_code == 200: result.append(r.content)
+                            if r.status_code == 200: imgs.append(r.content)
                         except: pass
-                    return result
-                img_bytes = await asyncio.get_running_loop().run_in_executor(None, _dl_imgs)
+                    music_url = data.get('music')
+                    if music_url:
+                        try:
+                            r = requests.get(music_url, headers=headers, timeout=20)
+                            if r.status_code == 200 and len(r.content) > 2000:
+                                audio_bytes = r.content
+                        except: pass
+                    return imgs, audio_bytes
+
+                img_bytes, audio_bytes = await asyncio.get_running_loop().run_in_executor(None, _dl_imgs_and_audio)
                 if img_bytes:
                     total = len(img_bytes)
-                    # إرسال على دفعات (Telegram يقبل 10 كحد أقصى للمجموعة)
                     for i in range(0, total, 10):
                         batch = img_bytes[i:i+10]
                         media = [InputMediaPhoto(b) for b in batch]
                         await ctx.bot.send_media_group(cid, media, reply_to_message_id=reply_id)
                         if i+10 < total: await asyncio.sleep(1)
-                    if data.get('music'):
-                        author_name = data.get('author', 'audio')
-                        await ctx.bot.send_audio(
-                            cid, data['music'],
-                            title=author_name,
-                            performer=author_name,
-                            caption=f"{cap}\n🖼 {total} صورة", parse_mode="HTML"
-                        )
+
+                    if audio_bytes:
+                        # اسم ملف صريح (safe_name.mp3) بدل الاعتماد على title/performer فقط
+                        safe_name = re.sub(r'[^\w\-]', '_', author)[:50] or 'audio'
+                        tmp_audio_dir = tempfile.mkdtemp()
+                        raw_audio_path = os.path.join(tmp_audio_dir, f'{safe_name}_raw.mp3')
+                        final_audio_path = os.path.join(tmp_audio_dir, f'{safe_name}.mp3')
+                        try:
+                            with open(raw_audio_path, 'wb') as f:
+                                f.write(audio_bytes)
+                            # أعد الترميز لـ mp3 حقيقي (الملف الأصلي أحياناً m4a بامتداد خاطئ)
+                            conv = subprocess.run(
+                                [FFMPEG, '-y', '-i', raw_audio_path, '-c:a', 'libmp3lame', '-q:a', '2', final_audio_path],
+                                capture_output=True, text=True, timeout=60
+                            )
+                            audio_to_send = final_audio_path if (conv.returncode == 0 and os.path.exists(final_audio_path)) else raw_audio_path
+                            with open(audio_to_send, 'rb') as f:
+                                await ctx.bot.send_audio(
+                                    cid, f,
+                                    filename=f'{safe_name}.mp3',
+                                    title=author,
+                                    performer=author,
+                                    caption=f"{cap}\n🖼 {total} صورة", parse_mode="HTML"
+                                )
+                        finally:
+                            shutil.rmtree(tmp_audio_dir, ignore_errors=True)
                 else:
-                    return await wm.edit_text("❌ تعذر تحميل الصور من هذه الألبوم.")
+                    await send_error(
+                        ctx, cid, msg.from_user,
+                        dev_msg="⚙️ [DEV] تيك توك — تعذّر تحميل صور الألبوم من tikwm.",
+                        user_msg="❌ تعذر تحميل الصور من هذه الألبوم.",
+                        target_message=wm
+                    )
+                    return
             else:
                 await ctx.bot.send_video(cid, data['data'], caption=cap, parse_mode="HTML",
                                          reply_to_message_id=reply_id, supports_streaming=True)
             return await wm.delete()
-        except Exception as e: logger.error(f"[TikTok send] {e}")
+        except Exception as e:
+            logger.error(f"[TikTok send] {e}")
+
     # محاولة 2: yt-dlp مباشرة (يدعم تيك توك + دوين)
     await wm.edit_text("⏳ محاولة بديلة...")
     is_douyin = 'douyin.com' in url
 
     def _dl_tiktok():
         tmp2 = tempfile.mkdtemp()
-        # قائمة إعدادات للمحاولة واحدة وراء الثانية
         attempts = []
         if is_douyin:
             attempts = [
-                # محاولة 1: douyin عبر yt-dlp بدون extractor args
                 {'format':'best[ext=mp4]/best',
                  'http_headers':{'User-Agent':'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36'}},
-                # محاولة 2: مع extractor args
                 {'format':'best',
                  'extractor_args':{'douyin':{'app_name':['trill']}},
                  'http_headers':{'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'}},
             ]
         else:
             attempts = [
-                # محاولة 1: TikTok بـ user agent عادي
                 {'format':'best[ext=mp4]/best',
                  'http_headers':{'User-Agent':'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15'}},
-                # محاولة 2: بـ user agent مختلف
                 {'format':'best',
                  'http_headers':{'User-Agent':'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36'}},
             ]
@@ -715,6 +834,7 @@ async def tiktok_handler(upd, ctx, url, cid, reply_id):
             'quiet':True,'nocheckcertificate':True,'geo_bypass':True,
             'ffmpeg_location':FFMPEG,'merge_output_format':'mp4',
         }
+        last_err = ""
         for attempt in attempts:
             try:
                 opts = {**base_opts, **attempt}
@@ -722,27 +842,30 @@ async def tiktok_handler(upd, ctx, url, cid, reply_id):
                     ydl.extract_info(url, download=True)
                     for f in os.listdir(tmp2):
                         if f.endswith(('.mp4','.webm','.mkv','.m4v')):
-                            return os.path.join(tmp2,f), tmp2
+                            return os.path.join(tmp2,f), tmp2, None
             except Exception as e:
+                last_err = str(e)
                 logger.warning(f"[TikTok attempt] {e}")
-                # نظّف الملفات الجزئية قبل المحاولة التالية
                 for f in os.listdir(tmp2):
                     try: os.remove(os.path.join(tmp2,f))
                     except: pass
-        return None, tmp2
+        return None, tmp2, last_err
 
-    fp, tmp = await asyncio.get_running_loop().run_in_executor(None, _dl_tiktok)
+    fp, tmp, last_err = await asyncio.get_running_loop().run_in_executor(None, _dl_tiktok)
     if fp and os.path.exists(fp):
         emoji = "🇨🇳 دوين" if is_douyin else "✅ تيك توك 🎵"
         with open(fp,'rb') as f: await ctx.bot.send_video(cid, f, caption=emoji, supports_streaming=True)
         await wm.delete()
     else:
-        await wm.edit_text(
-            "❌ فشل التحميل.\n" + ("• دوين يحتاج أحياناً VPN 🇨🇳" if is_douyin else "• قد يكون الرابط منتهياً أو الحساب خاص")
+        await send_error(
+            ctx, cid, msg.from_user,
+            dev_msg=f"⚙️ [DEV] {'دوين' if is_douyin else 'تيك توك'} فشل نهائياً:\n<code>{(last_err or '')[:400]}</code>",
+            user_msg="❌ فشل التحميل. قد يكون الرابط منتهياً أو الحساب خاص.",
+            target_message=wm
         )
     if tmp: shutil.rmtree(tmp, ignore_errors=True)
 
-async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=False, is_story=False):
+async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=False, is_story=False, user=None):
     """تحميل انستغرام — فيديو + صور ثابتة + ستوريات + كاروسيل (بوستات /p/)"""
     has_cookies = os.path.exists('cookies.txt')
     tmp = tempfile.mkdtemp()
@@ -981,10 +1104,13 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
     try:
         videos, images, title, audio_path = await asyncio.get_running_loop().run_in_executor(None, _dl)
         if not videos and not images and not audio_path:
-            await wm.edit_text(
-                "❌ ما لقيت محتوى.\n"
-                + ("• أضف كوكيز انستغرام للمحتوى الخاص\n" if not has_cookies else "")
-                + "• تأكد أن الحساب عام"
+            await send_error(
+                ctx, cid, user,
+                dev_msg=(f"⚙️ [DEV] انستغرام — ما لقيت محتوى.\n"
+                         f"cookies={'موجودة' if has_cookies else 'غير موجودة'}\n"
+                         f"الرابط: <code>{url[:200]}</code>"),
+                user_msg="❌ ما لقيت محتوى. تأكد أن الحساب عام.",
+                target_message=wm
             )
             return
         await _send(videos, images, title, audio_path)
@@ -992,11 +1118,26 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
         err = str(e)
         logger.error(f"[Insta] {err}")
         if 'login' in err.lower() or 'checkpoint' in err.lower():
-            await wm.edit_text("🔒 انستغرام يطلب تسجيل دخول. جدّد الكوكيز.")
+            await send_error(
+                ctx, cid, user,
+                dev_msg=f"⚙️ [DEV] انستغرام يطلب تسجيل دخول (كوكيز منتهية):\n<code>{err[:300]}</code>",
+                user_msg="🔒 تعذر التحميل. حاول مرة أخرى لاحقاً.",
+                target_message=wm
+            )
         elif 'private' in err.lower():
-            await wm.edit_text("❌ الحساب خاص.")
+            await send_error(
+                ctx, cid, user,
+                dev_msg=f"⚙️ [DEV] انستغرام — الحساب خاص:\n<code>{err[:300]}</code>",
+                user_msg="❌ الحساب خاص.",
+                target_message=wm
+            )
         else:
-            await wm.edit_text(f"❌ فشل: {err[:120]}")
+            await send_error(
+                ctx, cid, user,
+                dev_msg=f"⚙️ [DEV] خطأ انستغرام:\n<code>{err[:300]}</code>",
+                user_msg="❌ حدث خطأ، حاول مرة أخرى لاحقاً.",
+                target_message=wm
+            )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1035,7 +1176,7 @@ async def insta_handler(upd, ctx, url, cid):
 
     # منشورات عادية (ريلز / صور)
     wm = await msg.reply_text("📸 جاري التحميل من انستغرام...")
-    await _insta_download_and_send(ctx, cid, url, wm)
+    await _insta_download_and_send(ctx, cid, url, wm, user=msg.from_user)
 
 
 async def insta_stories_handler(upd, ctx, username, cid):
@@ -1122,10 +1263,20 @@ async def pinterest_handler(upd, ctx, url, cid):
                         return await wm.delete()
                 except: pass
 
-        await wm.edit_text("❌ ما قدرت أحمل من هذا الرابط.\nتأكد أن الـ Pin عام.")
+        await send_error(
+            ctx, cid, msg.from_user,
+            dev_msg=f"⚙️ [DEV] بينترست — لا فيديو ولا صورة قابلة للتحميل:\n<code>{url[:200]}</code>",
+            user_msg="❌ ما قدرت أحمل من هذا الرابط. تأكد أن الـ Pin عام.",
+            target_message=wm
+        )
     except Exception as e:
         logger.error(f"[Pinterest] {e}")
-        await wm.edit_text("❌ فشل التحميل من بينترست.")
+        await send_error(
+            ctx, cid, msg.from_user,
+            dev_msg=f"⚙️ [DEV] خطأ بينترست:\n<code>{str(e)[:400]}</code>",
+            user_msg="❌ فشل التحميل من بينترست.",
+            target_message=wm
+        )
     finally: shutil.rmtree(tmp, ignore_errors=True)
 
 async def music_handler(upd, ctx, url, cid, platform="🎵"):
@@ -1234,12 +1385,14 @@ async def spotify_handler(upd, ctx, url, cid):
     try:
         files, stdout, stderr = await asyncio.get_running_loop().run_in_executor(None, _dl)
         if not files:
-            # استخرج اسم الأغنية وابحث عليها بـ YouTube Music كـ fallback
-            return await wm.edit_text(
-                "❌ فشل التحميل من سبوتيفاي.\n\n"
-                "💡 انسخ اسم الأغنية وابعثه لـ يوتيوب ميوزك:\n"
-                "music.youtube.com وأرسل الرابط هنا 🎵"
+            await send_error(
+                ctx, cid, msg.from_user,
+                dev_msg=f"⚙️ [DEV] سبوتيفاي فشل — stderr:\n<code>{(stderr or '')[:400]}</code>",
+                user_msg=("❌ فشل التحميل من سبوتيفاي.\n\n"
+                          "💡 جرب البحث عن الأغنية بيوتيوب ميوزك وأرسل رابطها 🎵"),
+                target_message=wm
             )
+            return
         await wm.edit_text(f"📤 جاري الرفع {len(files)} مقطع...")
         for fp in files[:10]:
             name = os.path.basename(fp).rsplit('.', 1)[0]
@@ -1249,7 +1402,12 @@ async def spotify_handler(upd, ctx, url, cid):
         await wm.delete()
     except Exception as e:
         logger.error(f"[Spotify] {e}")
-        await wm.edit_text(f"❌ خطأ: {str(e)[:100]}")
+        await send_error(
+            ctx, cid, msg.from_user,
+            dev_msg=f"⚙️ [DEV] خطأ سبوتيفاي:\n<code>{str(e)[:400]}</code>",
+            user_msg="❌ حدث خطأ، حاول مرة أخرى لاحقاً.",
+            target_message=wm
+        )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1264,13 +1422,46 @@ async def tiktok_user_info(upd, ctx, username, cid):
 
     wm = await msg.reply_text(f"🔍 جاري جلب معلومات @{username}...")
 
-    COUNTRY_FLAG = {
-        'IQ':'🇮🇶','SA':'🇸🇦','US':'🇺🇸','GB':'🇬🇧','AE':'🇦🇪','EG':'🇪🇬',
-        'TR':'🇹🇷','IR':'🇮🇷','RU':'🇷🇺','DE':'🇩🇪','FR':'🇫🇷','IN':'🇮🇳',
-        'CN':'🇨🇳','JP':'🇯🇵','KR':'🇰🇷','BR':'🇧🇷','KW':'🇰🇼','QA':'🇶🇦',
-        'BH':'🇧🇭','OM':'🇴🇲','JO':'🇯🇴','SY':'🇸🇾','LB':'🇱🇧','YE':'🇾🇪',
-        'LY':'🇱🇾','TN':'🇹🇳','DZ':'🇩🇿','MA':'🇲🇦','SD':'🇸🇩','PK':'🇵🇰',
+    def _code_to_flag(cc: str) -> str:
+        """حوّل أي كود ISO ثنائي (مثل IQ) لعلمه 🇮🇶 تلقائياً — بدون قائمة محدودة"""
+        cc = (cc or '').strip().upper()
+        if len(cc) != 2 or not cc.isalpha():
+            return ''
+        try:
+            return ''.join(chr(0x1F1E6 + ord(ch) - ord('A')) for ch in cc)
+        except Exception:
+            return ''
+
+    # أسماء دول كاملة (بالإنجليزي/بالعربي) قد يرجعها الـ API أحياناً بدل الكود الثنائي
+    COUNTRY_NAME_TO_CODE = {
+        'iraq':'IQ','العراق':'IQ','saudi arabia':'SA','السعودية':'SA',
+        'united states':'US','usa':'US','united kingdom':'GB','uk':'GB',
+        'uae':'AE','united arab emirates':'AE','الامارات':'AE','مصر':'EG','egypt':'EG',
+        'turkey':'TR','تركيا':'TR','iran':'IR','ايران':'IR','russia':'RU','روسيا':'RU',
+        'germany':'DE','المانيا':'DE','france':'FR','فرنسا':'FR','india':'IN','الهند':'IN',
+        'china':'CN','الصين':'CN','japan':'JP','اليابان':'JP','south korea':'KR','كوريا الجنوبية':'KR',
+        'brazil':'BR','البرازيل':'BR','kuwait':'KW','الكويت':'KW','qatar':'QA','قطر':'QA',
+        'bahrain':'BH','البحرين':'BH','oman':'OM','عمان':'OM','jordan':'JO','الاردن':'JO',
+        'syria':'SY','سوريا':'SY','lebanon':'LB','لبنان':'LB','yemen':'YE','اليمن':'YE',
+        'libya':'LY','ليبيا':'LY','tunisia':'TN','تونس':'TN','algeria':'DZ','الجزائر':'DZ',
+        'morocco':'MA','المغرب':'MA','sudan':'SD','السودان':'SD','pakistan':'PK','باكستان':'PK',
     }
+
+    def _resolve_country_flag(raw: str):
+        """يرجع (flag_emoji, display_code_or_name) من قيمة region/location مهما كان شكلها"""
+        raw = (raw or '').strip()
+        if not raw:
+            return '', ''
+        # حالة 1: كود ثنائي مباشر (IQ, SA...)
+        flag = _code_to_flag(raw)
+        if flag:
+            return flag, raw.upper()
+        # حالة 2: اسم دولة كامل (عربي أو إنجليزي)
+        code = COUNTRY_NAME_TO_CODE.get(raw.lower().strip())
+        if code:
+            return _code_to_flag(code), raw
+        # حالة 3: ما قدرنا نطابقها — أرجع بدون علم لكن نعرض القيمة الخام بدل "غير معروف"
+        return '🌍', raw
 
     def _fetch_tikwm():
         """محاولة عبر tikwm (endpoints متعددة، بعضها معطّل حالياً فنجرب أكثر من واحد)"""
@@ -1363,8 +1554,9 @@ async def tiktok_user_info(upd, ctx, username, cid):
         verified = "✅ موثق" if (u.get('verified') or u.get('isVerified')) else "❌ غير موثق"
         private = "🔒 خاص" if (u.get('privateAccount') or u.get('secret')) else "🌐 عام"
         avatar = u.get('avatarLarger') or u.get('avatarMedium') or u.get('avatarThumb') or u.get('avatar', '')
-        region = (u.get('region') or u.get('location') or '').upper()
-        country_str = f"{COUNTRY_FLAG.get(region, '🌍')} {region}" if region else "🌍 غير معروف"
+        raw_region = u.get('region') or u.get('location') or ''
+        flag_emoji, display_region = _resolve_country_flag(raw_region)
+        country_str = f"{flag_emoji} {display_region}" if display_region else "🌍 غير معروف"
 
         create_ts = u.get('createTime') or u.get('createtime') or 0
         joined_str = ""
@@ -1705,10 +1897,10 @@ async def btn_cb(upd, ctx):
 
         if action == 'one':
             await _insta_download_and_send(ctx, cid_q, url, wm,
-                                           username=uname, download_all=False, is_story=True)
+                                           username=uname, download_all=False, is_story=True, user=q.from_user)
         else:
             await _insta_download_and_send(ctx, cid_q, all_url, wm,
-                                           username=uname, download_all=True, is_story=True)
+                                           username=uname, download_all=True, is_story=True, user=q.from_user)
         ctx.bot_data.pop(f'ist_{shash}', None)
         return
 
@@ -1874,9 +2066,16 @@ async def welcome_handler(upd, ctx):
         if not s.get("welcome",True): continue
         name=f'<a href="tg://user?id={m.id}">{m.first_name} {m.last_name or ""}</a>'.strip()
         uname = f"@{m.username}" if m.username else "لا يوجد"
-        # بطاقة مستخدم جديد: الاسم، اليوزر، الآيدي بشكل بارز
+        # عدّاد إجمالي الأعضاء بالمجموعة
+        try:
+            member_count = await ctx.bot.get_chat_member_count(upd.message.chat.id)
+            count_line = f"👥 <b>الإجمالي:</b> [{member_count}]\n"
+        except Exception:
+            count_line = ""
+        # بطاقة مستخدم جديد: الاسم، اليوزر، الآيدي، العدّاد
         txt = (
-            f"🆕 <b>مستخدم جديد!</b>\n\n"
+            f"🆕 <b>مستخدم جديد!</b>\n"
+            f"{count_line}\n"
             f"👤 <b>الاسم:</b> {name}\n"
             f"📛 <b>اليوزر:</b> {uname}\n"
             f"🆔 <b>الآيدي:</b> <code>{m.id}</code>\n\n"
