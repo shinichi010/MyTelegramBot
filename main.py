@@ -5,13 +5,16 @@ from concurrent.futures import ThreadPoolExecutor
 from html import escape as _esc
 from urllib.parse import urlparse
 from telegram import ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
-from telegram.error import TimedOut
+from telegram.error import TimedOut, InvalidToken, TelegramError
 from telegram.ext import Application, MessageHandler, CallbackQueryHandler, CommandHandler, filters
 from yt_dlp import YoutubeDL
 import imageio_ffmpeg
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+# روابط httpx فيها توكن البوت — لا تنطبع بسجلات Render
+for _n in ("httpx", "httpcore"):
+    logging.getLogger(_n).setLevel(logging.WARNING)
 
 # ═══════════════════════════════════════════════════════════════════
 # 1. القوائم والمحتوى
@@ -3057,6 +3060,29 @@ def _start_health_server():
     except Exception as e:
         logger.warning(f"⚠️ Health server failed: {e}")
 
+async def wait_for_telegram(app, attempts: int = 30):
+    """
+    إذا Telegram API ما رد وقت التشغيل (504/مهلة/شبكة) نعيد المحاولة بدل ما ينهار البوت
+    ويدخل بحلقة إعادة تشغيل على Render. التوكن الغلط (InvalidToken) يوقف فوراً.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            # get_me أول: يتأكد أن Telegram يرد ويخزّن بيانات البوت. (استدعاء initialize() لحاله ما يكفي:
+            # بعض إصدارات PTB تعتبر البوت "مهيّأ" حتى لو فشل get_me، فتتعطل الأوامر بعدين)
+            await app.bot.get_me()
+            await app.bot.initialize()
+            logger.info("✅ تم الاتصال بـ Telegram")
+            return
+        except InvalidToken:
+            logger.error("❌ توكن البوت مرفوض — تأكد من BOT_TOKEN")
+            raise
+        except TelegramError as e:
+            # NetworkError/TimedOut، وكذلك "Invalid server response" اللي تطلع بالإصدارات القديمة من PTB عند 504 (HTML)
+            wait = min(60, 5 * attempt)
+            logger.error(f"[startup] Telegram غير متاح ({type(e).__name__}) — محاولة {attempt}/{attempts}، إعادة بعد {wait} ثانية")
+            await asyncio.sleep(wait)
+    raise RuntimeError(f"تعذر الاتصال بـ Telegram بعد {attempts} محاولة")
+
 def main():
     token = os.environ.get("BOT_TOKEN", "")
     if not token:
@@ -3107,8 +3133,10 @@ def main():
         asyncio.create_task(_keep_alive(app))
     app.post_init = _post_init
     # بايثون 3.14+ ما عاد ينشئ event loop تلقائياً، وإصدارات PTB القديمة تحتاج واحد جاهز
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    app.run_polling(drop_pending_updates=True)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(wait_for_telegram(app))
+    app.run_polling(drop_pending_updates=True, bootstrap_retries=-1)
 
 if __name__ == "__main__":
     main()
