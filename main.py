@@ -1,5 +1,8 @@
-import logging, os, asyncio, random, re, hashlib, requests
+import logging, os, asyncio, random, re, hashlib, requests, time
 import tempfile, shutil, subprocess, sqlite3, json, threading, math
+import datetime as _dt
+from concurrent.futures import ThreadPoolExecutor
+from html import escape as _esc
 from urllib.parse import urlparse
 from telegram import ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from telegram.error import TimedOut
@@ -52,7 +55,7 @@ async def platform_blocked(upd, name: str) -> bool:
     dev = bool(msg and msg.from_user and is_dev(msg.from_user))
     await msg.reply_text(
         f"⚙️ [DEV] {name} موقوف — استخدم /admin لتفعيله." if dev
-        else "🔧 التحميل من هذي المنصة موقوف مؤقتاً للصيانة."
+        else T('maintenance')
     )
     return True
 
@@ -67,7 +70,7 @@ async def send_safe(coro):
         logger.warning("[send_safe] TimedOut — الملف غالباً وصل لتيليقرام")
         return None
 
-async def send_error(ctx, chat_id, user, dev_msg: str, user_msg: str = "❌ حدث خطأ، حاول مرة أخرى لاحقاً.",
+async def send_error(ctx, chat_id, user, dev_msg: str, user_msg: str = None,
                       target_message=None, parse_mode="HTML"):
     """
     رسالة خطأ موحّدة بنوعين:
@@ -77,7 +80,7 @@ async def send_error(ctx, chat_id, user, dev_msg: str, user_msg: str = "❌ حد
     target_message: إذا فيه رسالة "جاري التحميل..." موجودة، نعدّلها بدل إرسال رسالة جديدة.
     """
     is_developer = is_dev(user) if user else False
-    final_text = dev_msg if is_developer else user_msg
+    final_text = dev_msg if is_developer else (user_msg or T('error_generic'))
 
     sent_msg = None
     try:
@@ -220,13 +223,44 @@ def ttt_bot(board):
 # 2. قاعدة البيانات SQLite (بديل Firebase — يشتغل على Railway)
 # ═══════════════════════════════════════════════════════════════════
 DB_PATH = os.environ.get('DB_PATH', 'bot_data.db')
+MONGO_URI = os.environ.get('MONGO_URI', '').strip()          # إذا موجود → MongoDB (دائمة)
+MONGO_DB_NAME = os.environ.get('MONGO_DB', 'sikbot')
 _db_lock = threading.Lock()
+_io_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db-writer")  # كتابة بالترتيب بدون تعطيل البوت
+_mongo_kv = None      # collection: kv   (_id = path, value = نص JSON)
+_mongo_msgs = None    # collection: msgs (فيها TTL — تنحذف تلقائياً)
+DB_BACKEND = "sqlite"
+DB_WARNING = ""
 
-def _init_db():
+def _init_sqlite():
     with sqlite3.connect(DB_PATH) as c:
         c.execute('CREATE TABLE IF NOT EXISTS kv (path TEXT PRIMARY KEY, value TEXT)')
+        c.execute('CREATE TABLE IF NOT EXISTS msgs (k TEXT PRIMARY KEY, text TEXT, exp REAL)')
+        # سجل الرسائل القديم كان يتراكم للأبد — صار له جدول بمدة انتهاء
+        c.execute("DELETE FROM kv WHERE path LIKE 'messages/%'")
         c.commit()
-_init_db()
+
+def _init_mongo():
+    global _mongo_kv, _mongo_msgs, DB_BACKEND
+    from pymongo import MongoClient
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
+    client.admin.command('ping')
+    db = client[MONGO_DB_NAME]
+    _mongo_kv = db['kv']
+    _mongo_msgs = db['msgs']
+    _mongo_msgs.create_index('expireAt', expireAfterSeconds=0)   # حذف تلقائي عند وقت expireAt
+    DB_BACKEND = "mongo"
+
+if MONGO_URI:
+    try:
+        _init_mongo()
+        logger.info("✅ MongoDB متصل — البيانات دائمة")
+    except Exception as e:
+        DB_WARNING = f"تعذر الاتصال بـ MongoDB ({type(e).__name__}) — يُستخدم SQLite المؤقت"
+        logger.error(f"❌ {DB_WARNING}")
+        _init_sqlite()
+else:
+    _init_sqlite()
 
 # ── تحميل cookies من متغير البيئة (لـ Railway) ──
 def _load_cookies():
@@ -267,27 +301,342 @@ def _load_cookies():
         logger.error("❌ Failed to load cookies from COOKIES_DATA")
 _load_cookies()
 
+_UNSET = object()
+_cache: dict = {}    # path -> نص JSON أو None (غير موجود) — البوت هو الكاتب الوحيد فالكاش دقيق
+
+def _cache_put(path, raw):
+    if len(_cache) > 20000: _cache.clear()
+    _cache[path] = raw
+
+def _backend_get(path):
+    """يرجع نص JSON أو None."""
+    if DB_BACKEND == "mongo":
+        doc = _mongo_kv.find_one({'_id': path})
+        return doc['value'] if doc else None
+    with sqlite3.connect(DB_PATH) as c:
+        row = c.execute('SELECT value FROM kv WHERE path=?', (path,)).fetchone()
+        return row[0] if row else None
+
+def _backend_set(path, raw):
+    try:
+        if DB_BACKEND == "mongo":
+            if raw is None: _mongo_kv.delete_one({'_id': path})
+            else: _mongo_kv.replace_one({'_id': path}, {'_id': path, 'value': raw}, upsert=True)
+        else:
+            with sqlite3.connect(DB_PATH) as c:
+                if raw is None: c.execute('DELETE FROM kv WHERE path=?', (path,))
+                else: c.execute('INSERT OR REPLACE INTO kv (path,value) VALUES (?,?)', (path, raw))
+                c.commit()
+    except Exception as e:
+        logger.error(f"[db_set] {path}: {e}")
+
 def db_get(path: str, default=None):
     with _db_lock:
-        try:
-            with sqlite3.connect(DB_PATH) as c:
-                row = c.execute('SELECT value FROM kv WHERE path=?', (path,)).fetchone()
-                return json.loads(row[0]) if row else default
-        except Exception as e:
-            logger.error(f"[db_get] {path}: {e}")
-            return default
+        raw = _cache.get(path, _UNSET)
+        if raw is _UNSET:
+            try:
+                raw = _backend_get(path)
+            except Exception as e:
+                logger.error(f"[db_get] {path}: {e}")
+                return default
+            _cache_put(path, raw)
+    if raw is None: return default
+    try: return json.loads(raw)       # نسخة جديدة كل مرة (مثل السلوك القديم)
+    except Exception: return default
 
 def db_set(path: str, value):
-    with _db_lock:
-        try:
+    raw = None if value is None else json.dumps(value, ensure_ascii=False)
+    with _db_lock: _cache_put(path, raw)
+    if DB_BACKEND == "mongo": _io_pool.submit(_backend_set, path, raw)   # بالخلفية وبنفس الترتيب
+    else: _backend_set(path, raw)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 2b. رسائل مؤقتة (تنحذف تلقائياً) + إعدادات دائمة + نصوص قابلة للتعديل
+# ═══════════════════════════════════════════════════════════════════
+def cfg_get(key, default=None): return db_get(f"config/{key}", default)
+def cfg_set(key, value): db_set(f"config/{key}", value)
+
+def _now_utc(): return _dt.datetime.now(_dt.timezone.utc)
+
+def _retention_hours() -> int:
+    try: return max(1, min(24 * 30, int(cfg_get('msg_retention_hours', 48))))
+    except Exception: return 48
+
+def _msg_save_sync(cid, mid, text):
+    key = f"{cid}:{mid}"
+    hours = _retention_hours()
+    try:
+        if DB_BACKEND == "mongo":
+            _mongo_msgs.replace_one({'_id': key},
+                {'_id': key, 'text': text, 'expireAt': _now_utc() + _dt.timedelta(hours=hours)}, upsert=True)
+        else:
+            now = time.time()
             with sqlite3.connect(DB_PATH) as c:
-                if value is None:
-                    c.execute('DELETE FROM kv WHERE path=?', (path,))
-                else:
-                    c.execute('INSERT OR REPLACE INTO kv (path,value) VALUES (?,?)',
-                              (path, json.dumps(value, ensure_ascii=False)))
+                c.execute('INSERT OR REPLACE INTO msgs (k,text,exp) VALUES (?,?,?)', (key, text, now + hours * 3600))
+                if random.random() < 0.02:
+                    c.execute('DELETE FROM msgs WHERE exp < ?', (now,))
                 c.commit()
-        except Exception as e: logger.error(f"DB error: {e}")
+    except Exception as e:
+        logger.error(f"[msg_save] {e}")
+
+def _msg_get_sync(cid, mid):
+    key = f"{cid}:{mid}"
+    try:
+        if DB_BACKEND == "mongo":
+            doc = _mongo_msgs.find_one({'_id': key})
+            if not doc: return None
+            exp = doc.get('expireAt')
+            if exp is not None:
+                if exp.tzinfo is None: exp = exp.replace(tzinfo=_dt.timezone.utc)
+                if exp < _now_utc(): return None     # TTL يتأخر حتى دقيقة
+            return doc.get('text')
+        with sqlite3.connect(DB_PATH) as c:
+            row = c.execute('SELECT text, exp FROM msgs WHERE k=?', (key,)).fetchone()
+        return row[0] if row and row[1] > time.time() else None
+    except Exception as e:
+        logger.error(f"[msg_get] {e}")
+        return None
+
+async def msg_save(cid, mid, text):
+    await asyncio.get_running_loop().run_in_executor(None, _msg_save_sync, cid, mid, text)
+
+async def msg_get(cid, mid):
+    return await asyncio.get_running_loop().run_in_executor(None, _msg_get_sync, cid, mid)
+
+# المنصات الموقوفة تنحفظ وتبقى بعد إعادة التشغيل
+_DISABLED_PLATFORMS.update(cfg_get('disabled_platforms', []) or [])
+def _save_disabled(): cfg_set('disabled_platforms', sorted(_DISABLED_PLATFORMS))
+
+# ── النصوص القابلة للتعديل من /admin ──
+# لإضافة رسالة جديدة: أضف سطر هنا، واستبدل النص بالكود بـ T('المفتاح')
+TEXTS = {
+    'start_private': {
+        'label': '👋 رسالة /start (الترحيب)',
+        'vars': {'name': 'اسم المستخدم'},
+        'default': """أهلاً <b>{name}</b>! 👋
+
+📥 <b>المواقع المدعومة:</b>
+🎬 يوتيوب  🐦 X/تويتر  🎵 تيك توك
+🇨🇳 دوين  📘 فيس بوك  📸 انستغرام
+📌 بينترست  🎵 ساوند كلاود  🎵 يوتيوب ميوزك
+🎧 سبوتيفاي  🧵 ثريدز
+
+━━━━━━━━━━━━━━━━━━━━
+🌐 <code>ترجمة [نص]</code> — ترجمة للعربي
+🔢 <code>حساب [عملية]</code> — حاسبة
+🎵 <code>تيك @username</code> — معلومات تيك توك
+🔄 <code>تحويل</code> — رد على فيديو لتحويله لصوت
+
+👥 للمجموعات: أضفني مشرفاً واكتب <code>الاوامر</code>
+
+💡 أرسل أي رابط وأنا أتكفله! 🚀
+❓ /help — مساعدة""",
+    },
+    'group_added': {
+        'label': '👥 رسالة إضافة البوت لمجموعة',
+        'vars': {},
+        'default': "👋 <b>أهلاً! تم إضافتي للمجموعة!</b>\n\n⚠️ <b>لكي أعمل بشكل كامل:</b>\n1️⃣ اجعلني <b>مشرفاً</b> في المجموعة\n2️⃣ اكتب <code>الاوامر</code> لقائمة الأوامر الكاملة 📋\n",
+    },
+    'member_welcome': {
+        'label': '🎉 ترحيب العضو الجديد (السطر الأخير)',
+        'vars': {},
+        'default': "🎉 أهلاً وسهلاً بيك بالمجموعة!",
+    },
+    'maintenance': {
+        'label': '🔧 رسالة إيقاف منصة (صيانة)',
+        'vars': {},
+        'default': "🔧 التحميل من هذي المنصة موقوف مؤقتاً للصيانة.",
+    },
+    'error_generic': {
+        'label': '❌ رسالة الخطأ العامة',
+        'vars': {},
+        'default': "❌ حدث خطأ، حاول مرة أخرى لاحقاً.",
+    },
+    'too_big': {
+        'label': '📦 رسالة الفيديو أكبر من 50MB',
+        'vars': {},
+        'default': "❌ الفيديو أكبر من 50MB (حد تيليقرام للبوتات).",
+    },
+}
+
+def T(key, **values):
+    """نص الرسالة: المعدّل من لوحة الأدمن إن وُجد، وإلا الافتراضي."""
+    txt = db_get(f"texts/{key}") or TEXTS[key]['default']
+    for k, v in values.items():
+        txt = txt.replace('{' + k + '}', str(v))
+    return txt
+
+def _text_preview(key, txt=None):
+    meta = TEXTS[key]
+    txt = txt if txt is not None else (db_get(f"texts/{key}") or meta['default'])
+    for k, desc in meta['vars'].items():
+        txt = txt.replace('{' + k + '}', f"[{desc}]")
+    return txt
+
+# ── تسجيل المستخدمين + إشعار المطور عند أول /start ──
+_bg_tasks = set()
+
+def _spawn(coro):
+    t = asyncio.ensure_future(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+async def _notify_new_user(ctx, u, total, dev_chat):
+    try:
+        full = ' '.join(x for x in [u.first_name, getattr(u, 'last_name', None)] if x) or '—'
+        uname = f"@{_esc(u.username)}" if u.username else "لا يوجد"
+        caption = (
+            "🆕 <b>مستخدم جديد ضغط /start</b>\n\n"
+            f"👤 <b>الاسم:</b> <a href=\"tg://user?id={u.id}\">{_esc(full)}</a>\n"
+            f"🆔 <b>الآيدي:</b> <code>{u.id}</code>\n"
+            f"📛 <b>اليوزر:</b> {uname}\n"
+            f"🌐 <b>اللغة:</b> {_esc(u.language_code or '—')}\n"
+            f"👥 <b>إجمالي المستخدمين:</b> {total}"
+        )
+        photo_id = None
+        try:
+            ph = await ctx.bot.get_user_profile_photos(u.id, limit=1)
+            if ph.total_count > 0: photo_id = ph.photos[0][-1].file_id
+        except Exception as e:
+            logger.info(f"[new_user] no profile photo: {e}")
+        if photo_id: await ctx.bot.send_photo(dev_chat, photo_id, caption=caption, parse_mode="HTML")
+        else: await ctx.bot.send_message(dev_chat, caption, parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"[notify_new_user] {e}")
+
+async def register_user(upd, ctx):
+    """يسجّل المستخدم أول مرة ويبلّغ المطور (صورة + اسم + ايدي + يوزر). المطور نفسه: يحفظ chat_id فقط."""
+    try:
+        msg = upd.message; u = msg.from_user
+        if msg.chat.type != 'private' or u.is_bot: return
+        if is_dev(u):
+            if cfg_get('dev_chat_id') != msg.chat_id: cfg_set('dev_chat_id', msg.chat_id)
+            return
+        if db_get(f"users/{u.id}") is not None: return
+        db_set(f"users/{u.id}", {'name': u.first_name, 'username': u.username, 'ts': int(time.time())})
+        total = int(cfg_get('users_count', 0) or 0) + 1
+        cfg_set('users_count', total)
+        if not cfg_get('notify_new_users', True): return
+        dev_chat = os.environ.get('DEV_CHAT_ID') or cfg_get('dev_chat_id')
+        if not dev_chat:
+            logger.warning("[new_user] ما أعرف chat_id المطور — اكتب /start مرة وحدة من حسابك")
+            return
+        _spawn(_notify_new_user(ctx, u, total, int(dev_chat)))
+    except Exception as e:
+        logger.warning(f"[register_user] {e}")
+
+# ── لوحة المطور ──
+ADMIN_PLATFORMS = ['youtube', 'instagram', 'tiktok', 'facebook', 'x', 'spotify', 'soundcloud', 'pinterest']
+
+def _fmt_hours(h):
+    if h % 24 == 0:
+        d = h // 24
+        return "يوم" if d == 1 else "يومين" if d == 2 else f"{d} أيام" if d <= 10 else f"{d} يوم"
+    return f"{h} ساعة"
+
+def _cookie_info():
+    if not os.path.exists('cookies.txt'): return "❌ غير موجود"
+    try:
+        with open('cookies.txt', 'r') as f: c = f.read()
+        lines = [l for l in c.splitlines() if l and not l.startswith('#') and '\t' in l]
+        domains = set(l.split('\t')[0].lstrip('.') for l in lines)
+        return f"✅ {len(lines)} cookie — {', '.join(sorted(domains))}"
+    except Exception:
+        return "⚠️ موجود لكن تعذر قراءته"
+
+def admin_main(bot_username=None):
+    status = [f"{'🟢' if platform_enabled(p) else '🔴'} {p}" for p in ADMIN_PLATFORMS]
+    storage = "🟢 MongoDB (دائمة)" if DB_BACKEND == "mongo" else "🟠 SQLite محلي (يُمسح على Render المجاني)"
+    warn = f"\n⚠️ {_esc(DB_WARNING)}" if DB_WARNING else ""
+    text = (
+        "⚙️ <b>لوحة تحكم المطور</b>\n\n"
+        "<b>المنصات:</b>\n" + "\n".join(status) + "\n\n"
+        f"<b>🍪 الكوكيز:</b> {_cookie_info()}\n"
+        f"<b>💾 التخزين:</b> {storage}{warn}\n"
+        f"<b>🗑 مدة حفظ الرسائل:</b> {_fmt_hours(_retention_hours())}\n"
+        f"<b>👥 المستخدمين المسجلين:</b> {int(cfg_get('users_count', 0) or 0)}"
+    )
+    if bot_username: text += f"\n<b>🤖 البوت:</b> @{bot_username}"
+    rows = []
+    for p in ADMIN_PLATFORMS:
+        on = platform_enabled(p)
+        rows.append([InlineKeyboardButton(f"{'🔴 وقف' if on else '🟢 شغّل'} {p}", callback_data=f"adm_toggle_{p}")])
+    rows.append([InlineKeyboardButton("🔄 تحديث", callback_data="adm_refresh"),
+                 InlineKeyboardButton("🍪 فحص كوكيز", callback_data="adm_cookies")])
+    rows.append([InlineKeyboardButton("✏️ تعديل الرسائل", callback_data="adm_texts")])
+    rows.append([InlineKeyboardButton(f"🗑 مدة حفظ الرسائل: {_fmt_hours(_retention_hours())}", callback_data="adm_ret")])
+    rows.append([InlineKeyboardButton(f"🔔 إشعار المستخدمين الجدد: {'✅ شغال' if cfg_get('notify_new_users', True) else '❌ موقوف'}",
+                                      callback_data="adm_newuser")])
+    return text, InlineKeyboardMarkup(rows)
+
+async def admin_show_text(q, key):
+    meta = TEXTS[key]
+    custom = bool(db_get(f"texts/{key}"))
+    vars_line = ("\n<b>الحقول المتاحة:</b> " + "، ".join(f"<code>{{{k}}}</code> = {d}" for k, d in meta['vars'].items())) if meta['vars'] else ""
+    rows = [[InlineKeyboardButton("✏️ تعديل", callback_data=f"adm_te_{key}")]]
+    if custom: rows[0].append(InlineKeyboardButton("↩️ الافتراضي", callback_data=f"adm_tr_{key}"))
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="adm_texts")])
+    try:
+        await q.edit_message_text(
+            f"{meta['label']}\n{'✏️ معدّلة' if custom else '📄 الافتراضية'}{vars_line}\n\n━━━━━━━━━━\n" + _text_preview(key),
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    except Exception as e:
+        logger.info(f"[admin_show_text] {e}")
+
+async def admin_show_retention(q):
+    cur = _retention_hours()
+    btns = [InlineKeyboardButton(("✅ " if h == cur else "") + _fmt_hours(h), callback_data=f"adm_retset_{h}")
+            for h in (6, 12, 24, 48, 72, 168)]
+    rows = [btns[:3], btns[3:],
+            [InlineKeyboardButton("✏️ مدة مخصصة", callback_data="adm_retcustom")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="adm_refresh")]]
+    try:
+        await q.edit_message_text(
+            "🗑 <b>مدة حفظ الرسائل</b>\n\n"
+            "البوت يحفظ نص رسائل الكروبات مؤقتاً عشان يعرف النص القديم لما أحد يعدّل رسالته، "
+            "وبعد المدة تنحذف تلقائياً.\n\n"
+            f"<b>المدة الحالية:</b> {_fmt_hours(cur)}\n"
+            "<i>التغيير يطبق على الرسائل الجديدة.</i>",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    except Exception as e:
+        logger.info(f"[admin_show_retention] {e}")
+
+async def admin_wait_input(upd, ctx, wait):
+    """يستقبل رد المطور بعد ضغط 'تعديل' أو 'مدة مخصصة'."""
+    msg = upd.message
+    raw = (msg.text or '').strip()
+    if time.time() - wait.get('ts', 0) > 600:
+        ctx.user_data.pop('adm_wait', None)
+        return await msg.reply_text("⌛ انتهت مهلة التعديل (10 دقائق). افتح /admin من جديد.")
+    if raw in ('الغاء', 'إلغاء', 'cancel'):
+        ctx.user_data.pop('adm_wait', None)
+        return await msg.reply_text("❎ تم الإلغاء. /admin للرجوع للقائمة.")
+    if wait['kind'] == 'retention':
+        digits = raw.translate(str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789'))
+        if not digits.isdigit() or not 1 <= int(digits) <= 720:
+            return await msg.reply_text("❌ أرسل عدد ساعات من 1 إلى 720 (30 يوم)، أو اكتب «الغاء».")
+        h = int(digits)
+        cfg_set('msg_retention_hours', h)
+        ctx.user_data.pop('adm_wait', None)
+        return await msg.reply_text(f"✅ صارت مدة حفظ الرسائل <b>{_fmt_hours(h)}</b> (تطبق على الرسائل الجديدة).\n/admin للرجوع.",
+                                    parse_mode="HTML")
+    if wait['kind'] == 'text':
+        key = wait.get('key')
+        if key not in TEXTS:
+            ctx.user_data.pop('adm_wait', None)
+            return await msg.reply_text("❌ رسالة غير معروفة.")
+        new = msg.text_html or raw          # يحافظ على تنسيق تيليجرام (غامق/مائل/كود)
+        if len(new) > 3500:
+            return await msg.reply_text("❌ النص طويل جداً (الحد 3500 حرف). اختصره وأرسله مرة ثانية.")
+        try:
+            await msg.reply_text("👁 <b>معاينة:</b>\n\n" + _text_preview(key, new), parse_mode="HTML")
+        except Exception as e:
+            logger.info(f"[admin text invalid] {e}")
+            return await msg.reply_text("❌ تنسيق النص غير صالح — جرب مرة ثانية أو اكتب «الغاء».")
+        db_set(f"texts/{key}", new)
+        ctx.user_data.pop('adm_wait', None)
+        await msg.reply_text("✅ تم الحفظ — من الآن البوت يستخدم هذا النص.\n/admin للرجوع.")
 
 def get_settings(cid):
     return db_get(f"settings/{cid}", {
@@ -570,7 +919,7 @@ async def yt_handler(upd, ctx, url, uid):
 
     if not platform_enabled('youtube'):
         await msg.reply_text(
-            "🔧 التحميل من يوتيوب موقوف مؤقتاً للصيانة." if not dev else
+            T('maintenance') if not dev else
             "⚙️ [DEV] يوتيوب موقوف — استخدم /admin لتفعيله."
         )
         return
@@ -723,7 +1072,7 @@ async def auto_download(upd, ctx, url, cid, platform="🎬", max_height=1440):
                 await send_error(
                     ctx, cid, msg.from_user,
                     dev_msg=f"⚙️ [DEV] الملف كبير ({file_size // 1048576}MB) وحد تيليقرام 50MB — {platform}",
-                    user_msg="❌ الفيديو أكبر من 50MB (حد تيليقرام للبوتات).",
+                    user_msg=T('too_big'),
                     target_message=wm
                 )
                 return
@@ -810,7 +1159,7 @@ async def x_handler(upd, ctx, url, uid):
             await send_error(
                 ctx, cid, msg.from_user,
                 dev_msg=f"⚙️ [DEV] X: الملف كبير ({os.path.getsize(fp) // 1048576}MB) وحد تيليقرام 50MB",
-                user_msg="❌ الفيديو أكبر من 50MB (حد تيليقرام للبوتات).",
+                user_msg=T('too_big'),
                 target_message=wm
             )
         elif fp and os.path.exists(fp):
@@ -965,7 +1314,7 @@ async def tiktok_handler(upd, ctx, url, cid, reply_id):
         await send_error(
             ctx, cid, msg.from_user,
             dev_msg=f"⚙️ [DEV] تيك توك/دوين: الملف كبير ({os.path.getsize(fp) // 1048576}MB) وحد تيليقرام 50MB",
-            user_msg="❌ الفيديو أكبر من 50MB (حد تيليقرام للبوتات).",
+            user_msg=T('too_big'),
             target_message=wm
         )
     elif fp and os.path.exists(fp):
@@ -1728,44 +2077,9 @@ async def cmd_admin(upd, ctx):
     msg = upd.message
     if not is_dev(msg.from_user):
         return await msg.reply_text("❌ هذا الأمر للمطور فقط.")
-
-    platforms = ['youtube', 'instagram', 'tiktok', 'facebook', 'x', 'spotify', 'soundcloud', 'pinterest']
-    status_lines = []
-    for p in platforms:
-        icon = "🟢" if platform_enabled(p) else "🔴"
-        status_lines.append(f"{icon} {p}")
-
-    cookies_ok = os.path.exists('cookies.txt')
-    if cookies_ok:
-        try:
-            with open('cookies.txt', 'r') as f: c = f.read()
-            lines = [l for l in c.splitlines() if l and not l.startswith('#') and '\t' in l]
-            domains = set(l.split('\t')[0].lstrip('.') for l in lines)
-            cookie_info = f"✅ {len(lines)} cookie — {', '.join(sorted(domains))}"
-        except Exception:
-            cookie_info = "⚠️ موجود لكن تعذر قراءته"
-    else:
-        cookie_info = "❌ غير موجود"
-
-    db_size = os.path.getsize(os.environ.get('DB_PATH','bot_data.db')) // 1024 if os.path.exists(os.environ.get('DB_PATH','bot_data.db')) else 0
-
-    rows = []
-    for p in platforms:
-        action = "وقف" if platform_enabled(p) else "شغّل"
-        rows.append([InlineKeyboardButton(f"{'🔴 ' if platform_enabled(p) else '🟢 '}{action} {p}",
-                                          callback_data=f"adm_toggle_{p}")])
-    rows.append([InlineKeyboardButton("🔄 تحديث", callback_data="adm_refresh"),
-                 InlineKeyboardButton("🍪 فحص كوكيز", callback_data="adm_cookies")])
-
-    await msg.reply_text(
-        "⚙️ <b>لوحة تحكم المطور</b>\n\n"
-        "<b>المنصات:</b>\n" + "\n".join(status_lines) + "\n\n"
-        f"<b>🍪 الكوكيز:</b> {cookie_info}\n"
-        f"<b>💾 قاعدة البيانات:</b> {db_size} KB\n"
-        f"<b>🤖 البوت:</b> @{ctx.bot.username}",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(rows)
-    )
+    await register_user(upd, ctx)   # للمطور: يحفظ chat_id حتى توصله إشعارات المستخدمين الجدد
+    text, markup = admin_main(ctx.bot.username)
+    await msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 async def cmd_help(upd, ctx):
     """أمر المساعدة"""
@@ -1821,6 +2135,7 @@ async def cmd_id(upd, ctx):
 
 async def cmd_start(upd, ctx):
     msg = upd.message
+    await register_user(upd, ctx)
     if msg.chat.type == 'private' and msg.text.startswith('/start w_'):
         try:
             parts = msg.text.replace('/start w_','').split('_')
@@ -1833,22 +2148,7 @@ async def cmd_start(upd, ctx):
         except Exception: await msg.reply_text("خطأ في رابط الهمسة.")
     else:
         name = msg.from_user.first_name
-        await msg.reply_text(
-            f"أهلاً <b>{name}</b>! 👋\n\n"
-            "📥 <b>المواقع المدعومة:</b>\n"
-            "🎬 يوتيوب  🐦 X/تويتر  🎵 تيك توك\n"
-            "🇨🇳 دوين  📘 فيس بوك  📸 انستغرام\n"
-            "📌 بينترست  🎵 ساوند كلاود  🎵 يوتيوب ميوزك\n""🎧 سبوتيفاي  🧵 ثريدز\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "🌐 <code>ترجمة [نص]</code> — ترجمة للعربي\n"
-            "🔢 <code>حساب [عملية]</code> — حاسبة\n"
-            "🎵 <code>تيك @username</code> — معلومات تيك توك\n"
-            "🔄 <code>تحويل</code> — رد على فيديو لتحويله لصوت\n\n"
-            "👥 للمجموعات: أضفني مشرفاً واكتب <code>الاوامر</code>\n\n"
-            "💡 أرسل أي رابط وأنا أتكفله! 🚀\n"
-            "❓ /help — مساعدة",
-            parse_mode="HTML"
-        )
+        await msg.reply_text(T('start_private', name=_esc(name)), parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════════
 # 9. معالج الأزرار
@@ -1980,16 +2280,18 @@ async def btn_cb(upd, ctx):
             platform = action[7:]
             if platform in _DISABLED_PLATFORMS:
                 _DISABLED_PLATFORMS.discard(platform)
+                _save_disabled()
                 await q.answer(f"✅ {platform} مفعّل")
             else:
                 _DISABLED_PLATFORMS.add(platform)
+                _save_disabled()
                 await q.answer(f"🔴 {platform} موقوف")
             # تحديث الرسالة
-            await cmd_admin_refresh(q)
+            await cmd_admin_refresh(q, ctx)
             return
         if action == "refresh":
             await q.answer("🔄 تم التحديث")
-            await cmd_admin_refresh(q)
+            await cmd_admin_refresh(q, ctx)
             return
         if action == "cookies":
             if os.path.exists('cookies.txt'):
@@ -2004,6 +2306,64 @@ async def btn_cb(upd, ctx):
                 raw = os.environ.get('COOKIES_DATA','')
                 await q.answer(f"❌ cookies.txt غير موجود\nCOOKIES_DATA: {'موجود' if raw else 'مو موجود'} ({len(raw)} حرف)", show_alert=True)
             return
+        # ── تعديل الرسائل ──
+        if action == "texts":
+            await q.answer()
+            rows = [[InlineKeyboardButton(("✏️ " if db_get(f"texts/{k}") else "") + m['label'], callback_data=f"adm_t_{k}")]
+                    for k, m in TEXTS.items()]
+            rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="adm_refresh")])
+            try:
+                await q.edit_message_text("✏️ <b>تعديل الرسائل</b>\n\nاختر الرسالة اللي تريد تعدلها.\n(✏️ = معدّلة عن الافتراضي)",
+                                          parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+            except Exception as e: logger.info(f"[adm_texts] {e}")
+            return
+        if action.startswith("t_"):
+            key = action[2:]
+            if key not in TEXTS: return await q.answer("❌ رسالة غير معروفة", show_alert=True)
+            await q.answer(); await admin_show_text(q, key); return
+        if action.startswith("tr_"):
+            key = action[3:]
+            if key not in TEXTS: return await q.answer("❌ رسالة غير معروفة", show_alert=True)
+            db_set(f"texts/{key}", None)
+            await q.answer("↩️ رجعت للنص الافتراضي"); await admin_show_text(q, key); return
+        if action.startswith("te_"):
+            key = action[3:]
+            if key not in TEXTS: return await q.answer("❌ رسالة غير معروفة", show_alert=True)
+            ctx.user_data['adm_wait'] = {'kind': 'text', 'key': key, 'ts': time.time()}
+            await q.answer()
+            vars_line = ("\n<b>الحقول:</b> " + "، ".join(f"<code>{{{k}}}</code> = {d}" for k, d in TEXTS[key]['vars'].items())) if TEXTS[key]['vars'] else ""
+            try:
+                await q.edit_message_text(
+                    f"✏️ <b>{TEXTS[key]['label']}</b>\n\nأرسل <b>النص الجديد</b> الآن بالرسالة الجاية.\n"
+                    "تقدر تنسّقه بخيارات تيليجرام (غامق/مائل/كود).{vars_line}\n\n"
+                    "اكتب <code>الغاء</code> للإلغاء.".replace("{vars_line}", vars_line),
+                    parse_mode="HTML")
+            except Exception as e: logger.info(f"[adm_te] {e}")
+            return
+        # ── مدة حفظ الرسائل ──
+        if action == "ret":
+            await q.answer(); await admin_show_retention(q); return
+        if action.startswith("retset_"):
+            try: h = int(action[7:])
+            except ValueError: return await q.answer("❌", show_alert=True)
+            if not 1 <= h <= 720: return await q.answer("❌ خارج الحد", show_alert=True)
+            cfg_set('msg_retention_hours', h)
+            await q.answer(f"✅ صارت المدة {_fmt_hours(h)}")
+            await admin_show_retention(q); return
+        if action == "retcustom":
+            ctx.user_data['adm_wait'] = {'kind': 'retention', 'ts': time.time()}
+            await q.answer()
+            try:
+                await q.edit_message_text("✏️ أرسل <b>عدد الساعات</b> (من 1 إلى 720).\nمثال: <code>36</code>\n\nاكتب <code>الغاء</code> للإلغاء.",
+                                          parse_mode="HTML")
+            except Exception as e: logger.info(f"[adm_retcustom] {e}")
+            return
+        # ── إشعار المستخدمين الجدد ──
+        if action == "newuser":
+            on = not cfg_get('notify_new_users', True)
+            cfg_set('notify_new_users', on)
+            await q.answer("🔔 الإشعارات شغالة" if on else "🔕 الإشعارات موقوفة")
+            await cmd_admin_refresh(q, ctx); return
         return
 
     # ── أزرار ستوريات انستغرام ──
@@ -2155,39 +2515,18 @@ async def btn_cb(upd, ctx):
 # ═══════════════════════════════════════════════════════════════════
 # 10. معالجات متنوعة
 # ═══════════════════════════════════════════════════════════════════
-async def cmd_admin_refresh(q):
+async def cmd_admin_refresh(q, ctx=None):
     """تحديث رسالة لوحة المطور"""
-    platforms = ['youtube', 'instagram', 'tiktok', 'facebook', 'x', 'spotify', 'soundcloud', 'pinterest']
-    status_lines = [f"{'🟢' if platform_enabled(p) else '🔴'} {p}" for p in platforms]
-    cookies_ok = os.path.exists('cookies.txt')
-    cookie_info = "✅ موجود" if cookies_ok else "❌ غير موجود"
-    rows = []
-    for p in platforms:
-        action = "وقف" if platform_enabled(p) else "شغّل"
-        rows.append([InlineKeyboardButton(f"{'🔴 ' if platform_enabled(p) else '🟢 '}{action} {p}",
-                                          callback_data=f"adm_toggle_{p}")])
-    rows.append([InlineKeyboardButton("🔄 تحديث", callback_data="adm_refresh"),
-                 InlineKeyboardButton("🍪 فحص كوكيز", callback_data="adm_cookies")])
+    text, markup = admin_main(ctx.bot.username if ctx else None)
     try:
-        await q.edit_message_text(
-            "⚙️ <b>لوحة تحكم المطور</b>\n\n"
-            "<b>المنصات:</b>\n" + "\n".join(status_lines) + "\n\n"
-            f"<b>🍪 الكوكيز:</b> {cookie_info}",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(rows)
-        )
-    except Exception: pass
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    except Exception as e:
+        logger.info(f"[admin_refresh] {e}")
 
 async def welcome_handler(upd, ctx):
     for m in upd.message.new_chat_members:
         if m.id == ctx.bot.id:
-            await upd.message.reply_text(
-                "👋 <b>أهلاً! تم إضافتي للمجموعة!</b>\n\n"
-                "⚠️ <b>لكي أعمل بشكل كامل:</b>\n"
-                "1️⃣ اجعلني <b>مشرفاً</b> في المجموعة\n"
-                "2️⃣ اكتب <code>الاوامر</code> لقائمة الأوامر الكاملة 📋\n",
-                parse_mode="HTML"
-            )
+            await upd.message.reply_text(T('group_added'), parse_mode="HTML")
             continue
         if m.is_bot: continue
         s=get_settings(upd.message.chat.id)
@@ -2206,8 +2545,7 @@ async def welcome_handler(upd, ctx):
             f"{count_line}\n"
             f"👤 <b>الاسم:</b> {name}\n"
             f"📛 <b>اليوزر:</b> {uname}\n"
-            f"🆔 <b>الآيدي:</b> <code>{m.id}</code>\n\n"
-            f"🎉 أهلاً وسهلاً بيك بالمجموعة!"
+            f"🆔 <b>الآيدي:</b> <code>{m.id}</code>\n\n" + T('member_welcome')
         )
         try:
             p=await ctx.bot.get_user_profile_photos(m.id,limit=1)
@@ -2220,8 +2558,8 @@ async def edit_handler(upd, ctx):
     cid,mid=upd.edited_message.chat.id,upd.edited_message.message_id
     if not get_settings(cid).get("edit_notify",True): return
     new=upd.edited_message.text or "[ميديا]"
-    old=db_get(f"messages/{cid}/{mid}/text","[غير متوفر]")
-    db_set(f"messages/{cid}/{mid}",{"text":new})
+    old=await msg_get(cid, mid) or "[غير متوفر]"
+    await msg_save(cid, mid, new)
     await ctx.bot.send_message(cid,
         f"✏️ <b>تعديل رسالة</b>\n👤 {upd.edited_message.from_user.first_name}\n❌ <code>{old[:200]}</code>\n✅ <code>{new[:200]}</code>",
         parse_mode="HTML")
@@ -2245,7 +2583,7 @@ async def media_filter(upd, ctx):
 
 async def track_msg(upd, ctx):
     if not upd.message or not upd.message.text or upd.message.text.startswith('/'): return
-    db_set(f"messages/{upd.message.chat.id}/{upd.message.message_id}",{"text":upd.message.text})
+    await msg_save(upd.message.chat.id, upd.message.message_id, upd.message.text)
 
 # ═══════════════════════════════════════════════════════════════════
 # 11. المعالج الرئيسي
@@ -2258,6 +2596,9 @@ async def handle_msg(upd, ctx):
 
     # ══ خاص ══
     if msg.chat.type=='private':
+        wait = ctx.user_data.get('adm_wait')
+        if wait and is_dev(msg.from_user):
+            return await admin_wait_input(upd, ctx, wait)
         if ctx.user_data.get('wt'):
             # همسة بالخاص
             tid=ctx.user_data.pop('wt'); wc=ctx.user_data.pop('wc',None)
