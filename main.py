@@ -1,7 +1,9 @@
 import logging, os, asyncio, random, re, hashlib, requests
 import tempfile, shutil, subprocess, sqlite3, json, threading, math
-from telegram import Update, ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
-from telegram.ext import Application, MessageHandler, CallbackQueryHandler, CommandHandler, filters, ContextTypes
+from urllib.parse import urlparse
+from telegram import ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+from telegram.error import TimedOut
+from telegram.ext import Application, MessageHandler, CallbackQueryHandler, CommandHandler, filters
 from yt_dlp import YoutubeDL
 import imageio_ffmpeg
 
@@ -13,7 +15,7 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════
 WA3ED_LIST = [
     "عيونها السود والبيض 👀",
-    " هلا بالحلو \ ة 🌸",
+    " هلا بالحلو \\ ة 🌸",
     "مالي خلقك 😏",
     "اتسرسح منا وليدي 😤",
     "انا هسه مشغولة 😅",
@@ -41,6 +43,29 @@ def is_dev(user) -> bool:
 
 def platform_enabled(name: str) -> bool:
     return name not in _DISABLED_PLATFORMS
+
+async def platform_blocked(upd, name: str) -> bool:
+    """True إذا المنصة موقوفة من لوحة المطور (ويرسل رسالة الصيانة)."""
+    if platform_enabled(name):
+        return False
+    msg = upd.message
+    dev = bool(msg and msg.from_user and is_dev(msg.from_user))
+    await msg.reply_text(
+        f"⚙️ [DEV] {name} موقوف — استخدم /admin لتفعيله." if dev
+        else "🔧 التحميل من هذي المنصة موقوف مؤقتاً للصيانة."
+    )
+    return True
+
+async def send_safe(coro):
+    """
+    TimedOut أثناء رفع ملف غالباً يعني أن تيليقرام استلم الملف فعلاً وراح يوصله،
+    فما نعتبره فشل (حتى ما تطلع رسالة خطأ والمقطع جاي).
+    """
+    try:
+        return await coro
+    except TimedOut:
+        logger.warning("[send_safe] TimedOut — الملف غالباً وصل لتيليقرام")
+        return None
 
 async def send_error(ctx, chat_id, user, dev_msg: str, user_msg: str = "❌ حدث خطأ، حاول مرة أخرى لاحقاً.",
                       target_message=None, parse_mode="HTML"):
@@ -77,6 +102,23 @@ async def send_error(ctx, chat_id, user, dev_msg: str, user_msg: str = "❌ حد
             except Exception:
                 pass
         asyncio.create_task(_auto_delete())
+
+# ── حد رفع تيليقرام للبوتات + أدوات الروابط ──
+TG_MAX_BYTES = 50 * 1024 * 1024
+URL_RE = re.compile(r'https?://\S+', re.I)
+
+def find_url(text: str):
+    """أول رابط حقيقي بالنص، أو None."""
+    m = URL_RE.search(text or "")
+    return m.group() if m else None
+
+def host_in(url: str, *domains) -> bool:
+    """هل دومين الرابط (أو أي دومين فرعي منه) من القائمة؟ — يمنع مطابقة netflix.com كـ x.com."""
+    try:
+        host = (urlparse(url).hostname or '').lower()
+    except Exception:
+        return False
+    return any(host == d or host.endswith('.' + d) for d in domains)
 
 LANG_FLAG = {
     'ar':'🇸🇦','en':'🇬🇧','tr':'🇹🇷','fa':'🇮🇷','ru':'🇷🇺',
@@ -129,6 +171,50 @@ def mk_main(): return InlineKeyboardMarkup([[
     InlineKeyboardButton("🎮 التسلية", callback_data="cmd_fun")],
     [InlineKeyboardButton("📥 التحميل", callback_data="cmd_dl")]])
 def mk_back(): return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 القائمة", callback_data="cmd_main")]])
+
+# ── إكس أو: الدوال المساعدة ──
+_TTT_LINES = ((0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6))
+
+def ttt_winner(board):
+    """يرجع 'X' أو 'O' إذا فيه فائز، وإلا None."""
+    for a, b, c in _TTT_LINES:
+        if board[a] and board[a] == board[b] == board[c]:
+            return board[a]
+    return None
+
+def ttt_kb(board, gid):
+    """لوحة 3x3 — الخلية الفارغة ttt_{gid}_{i}، المشغولة ttt_noop، وزر إعادة."""
+    rows = []
+    for r in range(3):
+        row = []
+        for c in range(3):
+            i = r * 3 + c
+            v = board[i]
+            if v == 'X':
+                row.append(InlineKeyboardButton("❌", callback_data="ttt_noop"))
+            elif v == 'O':
+                row.append(InlineKeyboardButton("⭕", callback_data="ttt_noop"))
+            else:
+                row.append(InlineKeyboardButton("▫️", callback_data=f"ttt_{gid}_{i}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔄 لعبة جديدة", callback_data=f"ttt_reset_{gid}")])
+    return InlineKeyboardMarkup(rows)
+
+def ttt_bot(board):
+    """حركة البوت (O): يفوز إذا يكدر، يمنع فوزك، ثم الوسط، ثم عشوائي."""
+    empty = [i for i, v in enumerate(board) if v == '']
+    if not empty:
+        return None
+    for sym in ('O', 'X'):
+        for i in empty:
+            board[i] = sym
+            won = ttt_winner(board) == sym
+            board[i] = ''
+            if won:
+                return i
+    if 4 in empty:
+        return 4
+    return random.choice(empty)
 
 # ═══════════════════════════════════════════════════════════════════
 # 2. قاعدة البيانات SQLite (بديل Firebase — يشتغل على Railway)
@@ -187,7 +273,9 @@ def db_get(path: str, default=None):
             with sqlite3.connect(DB_PATH) as c:
                 row = c.execute('SELECT value FROM kv WHERE path=?', (path,)).fetchone()
                 return json.loads(row[0]) if row else default
-        except: return default
+        except Exception as e:
+            logger.error(f"[db_get] {path}: {e}")
+            return default
 
 def db_set(path: str, value):
     with _db_lock:
@@ -240,7 +328,9 @@ async def is_tg_owner(upd, ctx):
     try:
         admins = await ctx.bot.get_chat_administrators(upd.effective_chat.id)
         return any(a.user.id == upd.effective_user.id and a.status == "creator" for a in admins)
-    except: return False
+    except Exception as e:
+        logger.warning(f"[is_tg_owner] {e}")
+        return False
 
 async def is_priv(upd, ctx, min_role=ROLE_OWNER):
     r = get_role(upd.effective_chat.id, upd.effective_user.id)
@@ -308,7 +398,7 @@ async def _progress_updater(ctx, cid, mid, smid, is_photo=False):
                 if is_photo: await ctx.bot.edit_message_caption(chat_id=cid, message_id=smid, caption=t)
                 else: await ctx.bot.edit_message_text(t, chat_id=cid, message_id=smid)
                 last = cur
-            except: pass
+            except Exception: pass
         await asyncio.sleep(2.5)
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
@@ -552,7 +642,7 @@ async def yt_handler(upd, ctx, url, uid):
         else:
             await msg.reply_text(cap, parse_mode="HTML", reply_markup=kb)
         await wm.delete()
-    except:
+    except Exception:
         await wm.edit_text(cap, parse_mode="HTML", reply_markup=kb)
 
 async def auto_download(upd, ctx, url, cid, platform="🎬", max_height=1440):
@@ -629,6 +719,14 @@ async def auto_download(upd, ctx, url, cid, platform="🎬", max_height=1440):
                 logger.warning(f"[auto_dl reencode] {reencode_err}")
 
             file_size = os.path.getsize(final_fp)
+            if file_size > TG_MAX_BYTES:
+                await send_error(
+                    ctx, cid, msg.from_user,
+                    dev_msg=f"⚙️ [DEV] الملف كبير ({file_size // 1048576}MB) وحد تيليقرام 50MB — {platform}",
+                    user_msg="❌ الفيديو أكبر من 50MB (حد تيليقرام للبوتات).",
+                    target_message=wm
+                )
+                return
             if file_size < 1000:
                 await send_error(
                     ctx, cid, msg.from_user,
@@ -642,12 +740,12 @@ async def auto_download(upd, ctx, url, cid, platform="🎬", max_height=1440):
             safe_title = re.sub(r'[^\w\-]', '_', (title or platform))[:60] or 'video'
             fname = f"{safe_title}.mp4"
             with open(final_fp, 'rb') as f:
-                await ctx.bot.send_video(
+                await send_safe(ctx.bot.send_video(
                     cid, f,
                     filename=fname,
                     caption=f"{platform} {title[:60]}" if title else platform,
                     supports_streaming=True
-                )
+                ))
             await wm.delete()
         else:
             await send_error(
@@ -670,10 +768,12 @@ async def auto_download(upd, ctx, url, cid, platform="🎬", max_height=1440):
 
 async def fb_handler(upd, ctx, url, uid):
     """فيس بوك — تحميل تلقائي بأعلى جودة"""
+    if await platform_blocked(upd, 'facebook'): return
     await auto_download(upd, ctx, url, upd.message.chat_id, "📘")
 
 async def x_handler(upd, ctx, url, uid):
     """X/Twitter — تحميل تلقائي بأعلى جودة"""
+    if await platform_blocked(upd, 'x'): return
     msg = upd.message
     cid = msg.chat_id
     has_cookies = os.path.exists('cookies.txt')
@@ -699,16 +799,24 @@ async def x_handler(upd, ctx, url, uid):
                         key=os.path.getsize, reverse=True
                     )
                     if files: return files[0], info.get('title','')
-            except: pass
+            except Exception as e:
+                logger.warning(f"[X dl] {try_url[:80]}: {e}")
         return None, ''
 
     try:
         fp, title = await asyncio.get_running_loop().run_in_executor(None, _dl)
         active_dl.pop(msg.message_id, None); prog.cancel()
-        if fp and os.path.exists(fp):
+        if fp and os.path.exists(fp) and os.path.getsize(fp) > TG_MAX_BYTES:
+            await send_error(
+                ctx, cid, msg.from_user,
+                dev_msg=f"⚙️ [DEV] X: الملف كبير ({os.path.getsize(fp) // 1048576}MB) وحد تيليقرام 50MB",
+                user_msg="❌ الفيديو أكبر من 50MB (حد تيليقرام للبوتات).",
+                target_message=wm
+            )
+        elif fp and os.path.exists(fp):
             await wm.edit_text("📤 جاري الرفع...")
             with open(fp,'rb') as f:
-                await ctx.bot.send_video(cid, f, caption=f"🐦 {title[:60]}" if title else "🐦 X", supports_streaming=True)
+                await send_safe(ctx.bot.send_video(cid, f, caption=f"🐦 {title[:60]}" if title else "🐦 X", supports_streaming=True))
             await wm.delete()
         else:
             await send_error(
@@ -730,6 +838,7 @@ async def x_handler(upd, ctx, url, uid):
         shutil.rmtree(tmp, ignore_errors=True)
 
 async def tiktok_handler(upd, ctx, url, cid, reply_id):
+    if await platform_blocked(upd, 'tiktok'): return
     msg = upd.message
     wm = await msg.reply_text("⏳ جاري التحميل...")
     # محاولة 1: tikwm API (يدعم تيك توك + دوين)
@@ -748,14 +857,14 @@ async def tiktok_handler(upd, ctx, url, cid, reply_id):
                         try:
                             r = requests.get(img_url, headers=headers, timeout=15)
                             if r.status_code == 200: imgs.append(r.content)
-                        except: pass
+                        except Exception: pass
                     music_url = data.get('music')
                     if music_url:
                         try:
                             r = requests.get(music_url, headers=headers, timeout=20)
                             if r.status_code == 200 and len(r.content) > 2000:
                                 audio_bytes = r.content
-                        except: pass
+                        except Exception: pass
                     return imgs, audio_bytes
 
                 img_bytes, audio_bytes = await asyncio.get_running_loop().run_in_executor(None, _dl_imgs_and_audio)
@@ -764,7 +873,7 @@ async def tiktok_handler(upd, ctx, url, cid, reply_id):
                     for i in range(0, total, 10):
                         batch = img_bytes[i:i+10]
                         media = [InputMediaPhoto(b) for b in batch]
-                        await ctx.bot.send_media_group(cid, media, reply_to_message_id=reply_id)
+                        await send_safe(ctx.bot.send_media_group(cid, media, reply_to_message_id=reply_id))
                         if i+10 < total: await asyncio.sleep(1)
 
                     if audio_bytes:
@@ -783,13 +892,13 @@ async def tiktok_handler(upd, ctx, url, cid, reply_id):
                             )
                             audio_to_send = final_audio_path if (conv.returncode == 0 and os.path.exists(final_audio_path)) else raw_audio_path
                             with open(audio_to_send, 'rb') as f:
-                                await ctx.bot.send_audio(
+                                await send_safe(ctx.bot.send_audio(
                                     cid, f,
                                     filename=f'{safe_name}.mp3',
                                     title=author,
                                     performer=author,
                                     caption=f"{cap}\n🖼 {total} صورة", parse_mode="HTML"
-                                )
+                                ))
                         finally:
                             shutil.rmtree(tmp_audio_dir, ignore_errors=True)
                 else:
@@ -801,8 +910,8 @@ async def tiktok_handler(upd, ctx, url, cid, reply_id):
                     )
                     return
             else:
-                await ctx.bot.send_video(cid, data['data'], caption=cap, parse_mode="HTML",
-                                         reply_to_message_id=reply_id, supports_streaming=True)
+                await send_safe(ctx.bot.send_video(cid, data['data'], caption=cap, parse_mode="HTML",
+                                                   reply_to_message_id=reply_id, supports_streaming=True))
             return await wm.delete()
         except Exception as e:
             logger.error(f"[TikTok send] {e}")
@@ -848,13 +957,20 @@ async def tiktok_handler(upd, ctx, url, cid, reply_id):
                 logger.warning(f"[TikTok attempt] {e}")
                 for f in os.listdir(tmp2):
                     try: os.remove(os.path.join(tmp2,f))
-                    except: pass
+                    except Exception: pass
         return None, tmp2, last_err
 
     fp, tmp, last_err = await asyncio.get_running_loop().run_in_executor(None, _dl_tiktok)
-    if fp and os.path.exists(fp):
+    if fp and os.path.exists(fp) and os.path.getsize(fp) > TG_MAX_BYTES:
+        await send_error(
+            ctx, cid, msg.from_user,
+            dev_msg=f"⚙️ [DEV] تيك توك/دوين: الملف كبير ({os.path.getsize(fp) // 1048576}MB) وحد تيليقرام 50MB",
+            user_msg="❌ الفيديو أكبر من 50MB (حد تيليقرام للبوتات).",
+            target_message=wm
+        )
+    elif fp and os.path.exists(fp):
         emoji = "🇨🇳 دوين" if is_douyin else "✅ تيك توك 🎵"
-        with open(fp,'rb') as f: await ctx.bot.send_video(cid, f, caption=emoji, supports_streaming=True)
+        with open(fp,'rb') as f: await send_safe(ctx.bot.send_video(cid, f, caption=emoji, supports_streaming=True))
         await wm.delete()
     else:
         await send_error(
@@ -899,7 +1015,7 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
                             parts = line.strip().split('\t')
                             if len(parts) >= 7 and 'instagram.com' in parts[0]:
                                 cookies[parts[5]] = parts[6]
-                except: pass
+                except Exception: pass
             r = requests.get(page_url, headers=headers, cookies=cookies, timeout=20)
             html = r.text
 
@@ -1075,11 +1191,11 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
         return videos, images, title, audio_path
 
     async def _send(videos, images, title, audio_path):
-        await wm.edit_text(f"📤 جاري الرفع...")
+        await wm.edit_text("📤 جاري الرفع...")
         for v in videos[:5]:
             if os.path.getsize(v) < 50 * 1024 * 1024:
                 with open(v, 'rb') as f:
-                    await ctx.bot.send_video(cid, f, caption=f"📸 {title[:60]}", supports_streaming=True)
+                    await send_safe(ctx.bot.send_video(cid, f, caption=f"📸 {title[:60]}", supports_streaming=True))
         if images:
             for i in range(0, min(len(images), 20), 10):
                 batch = images[i:i + 10]
@@ -1143,6 +1259,7 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
 
 async def insta_handler(upd, ctx, url, cid):
     """انستغرام — ريلز + صور + ستوريات"""
+    if await platform_blocked(upd, 'instagram'): return
     msg = upd.message
     has_cookies = os.path.exists('cookies.txt')
     is_story = '/stories/' in url
@@ -1181,6 +1298,7 @@ async def insta_handler(upd, ctx, url, cid):
 
 async def insta_stories_handler(upd, ctx, username, cid):
     """ستوري @username — يعرض زرين"""
+    if await platform_blocked(upd, 'instagram'): return
     msg = upd.message
     username = username.lstrip('@').strip()
     has_cookies = os.path.exists('cookies.txt')
@@ -1208,6 +1326,7 @@ async def insta_stories_handler(upd, ctx, username, cid):
 
 async def pinterest_handler(upd, ctx, url, cid):
     """بينترست — فيديو وصور"""
+    if await platform_blocked(upd, 'pinterest'): return
     msg = upd.message
     wm = await msg.reply_text("📌 جاري التحميل من بينترست...")
     tmp = tempfile.mkdtemp()
@@ -1244,7 +1363,7 @@ async def pinterest_handler(upd, ctx, url, cid):
                 await wm.edit_text("📤 جاري الرفع...")
                 ext = fp.rsplit('.',1)[-1].lower()
                 if ext in ('mp4','webm','mkv'):
-                    with open(fp,'rb') as f: await ctx.bot.send_video(cid,f,caption=f"📌 {title[:60]}",supports_streaming=True)
+                    with open(fp,'rb') as f: await send_safe(ctx.bot.send_video(cid,f,caption=f"📌 {title[:60]}",supports_streaming=True))
                 else:
                     with open(fp,'rb') as f: await ctx.bot.send_photo(cid,f,caption=f"📌 {title[:60]}")
                 return await wm.delete()
@@ -1261,7 +1380,7 @@ async def pinterest_handler(upd, ctx, url, cid):
                     if r.status_code == 200 and len(r.content) > 1000:
                         await ctx.bot.send_photo(cid, r.content, caption=f"📌 {title[:60]}")
                         return await wm.delete()
-                except: pass
+                except Exception: pass
 
         await send_error(
             ctx, cid, msg.from_user,
@@ -1281,6 +1400,7 @@ async def pinterest_handler(upd, ctx, url, cid):
 
 async def music_handler(upd, ctx, url, cid, platform="🎵"):
     """تحميل صوت بأعلى جودة (320kbps MP3)"""
+    if await platform_blocked(upd, 'soundcloud' if 'soundcloud' in url else 'youtube'): return
     msg = upd.message
     wm = await msg.reply_text(f"{platform} جاري تحميل الصوت بأعلى جودة...")
     tmp = tempfile.mkdtemp()
@@ -1308,7 +1428,9 @@ async def music_handler(upd, ctx, url, cid, platform="🎵"):
         return None,'',''
     try:
         fp,title,artist = await asyncio.get_running_loop().run_in_executor(None, _dl)
-        if fp and os.path.exists(fp):
+        if fp and os.path.exists(fp) and os.path.getsize(fp) > TG_MAX_BYTES:
+            await wm.edit_text("❌ الملف أكبر من 50MB (حد تيليقرام للبوتات).\n• جرب مقطع أقصر")
+        elif fp and os.path.exists(fp):
             await wm.edit_text("📤 جاري الرفع...")
             with open(fp,'rb') as f:
                 await ctx.bot.send_audio(
@@ -1340,6 +1462,7 @@ async def music_handler(upd, ctx, url, cid, platform="🎵"):
 
 async def spotify_handler(upd, ctx, url, cid):
     """سبوتيفاي — تحميل عبر yt-dlp مباشرة (لا يحتاج Deno)"""
+    if await platform_blocked(upd, 'spotify'): return
     msg = upd.message
     wm = await msg.reply_text("🎧 جاري التحميل من سبوتيفاي...")
     tmp = tempfile.mkdtemp()
@@ -1502,7 +1625,6 @@ async def tiktok_user_info(upd, ctx, username, cid):
                     ents = list(info['entries'])
                     entry = ents[0] if ents else info
                 if not entry: return None
-                uploader = entry.get('uploader') or username
                 return {
                     'code': 0,
                     'data': {
@@ -1564,7 +1686,7 @@ async def tiktok_user_info(upd, ctx, username, cid):
             try:
                 import datetime
                 joined_str = "\n📅 <b>تاريخ الانضمام:</b> " + datetime.datetime.fromtimestamp(int(create_ts)).strftime('%Y/%m/%d')
-            except: pass
+            except Exception: pass
 
         # بطاقة على طراز "مستخدم جديد": الاسم، اليوزر، الصورة، الـ ID بارزين بالأعلى
         txt = (
@@ -1620,7 +1742,7 @@ async def cmd_admin(upd, ctx):
             lines = [l for l in c.splitlines() if l and not l.startswith('#') and '\t' in l]
             domains = set(l.split('\t')[0].lstrip('.') for l in lines)
             cookie_info = f"✅ {len(lines)} cookie — {', '.join(sorted(domains))}"
-        except:
+        except Exception:
             cookie_info = "⚠️ موجود لكن تعذر قراءته"
     else:
         cookie_info = "❌ غير موجود"
@@ -1636,8 +1758,8 @@ async def cmd_admin(upd, ctx):
                  InlineKeyboardButton("🍪 فحص كوكيز", callback_data="adm_cookies")])
 
     await msg.reply_text(
-        f"⚙️ <b>لوحة تحكم المطور</b>\n\n"
-        f"<b>المنصات:</b>\n" + "\n".join(status_lines) + "\n\n"
+        "⚙️ <b>لوحة تحكم المطور</b>\n\n"
+        "<b>المنصات:</b>\n" + "\n".join(status_lines) + "\n\n"
         f"<b>🍪 الكوكيز:</b> {cookie_info}\n"
         f"<b>💾 قاعدة البيانات:</b> {db_size} KB\n"
         f"<b>🤖 البوت:</b> @{ctx.bot.username}",
@@ -1708,7 +1830,7 @@ async def cmd_start(upd, ctx):
                 return await msg.reply_text("الرابط مو إلك! ❌")
             ctx.user_data.update({'wt':target_id,'wc':chat_id})
             await msg.reply_text("🔒 *أرسل همستك الآن:*\n_(سيتم إرسالها للكروب تلقائياً)_ 🤫", parse_mode="Markdown")
-        except: await msg.reply_text("خطأ في رابط الهمسة.")
+        except Exception: await msg.reply_text("خطأ في رابط الهمسة.")
     else:
         name = msg.from_user.first_name
         await msg.reply_text(
@@ -1769,7 +1891,7 @@ async def btn_cb(upd, ctx):
             try:
                 if is_photo: await q.edit_message_caption(t)
                 else: await q.edit_message_text(t)
-            except: pass
+            except Exception: pass
         if not url: return await em("❌ الرابط منتهي. أعد إرساله.")
         await em("⏳ جاري تحضير الملف...")
         mt = "audio" if action=="audio" else "video"
@@ -1795,16 +1917,22 @@ async def btn_cb(upd, ctx):
                     for f in sorted(os.listdir(tmp), key=lambda x: os.path.getsize(os.path.join(tmp,x)), reverse=True):
                         if f.endswith(('.mp4','.webm','.mkv')): return os.path.join(tmp,f), info.get('title','')
                 return None,None
-            fp,title = await asyncio.get_running_loop().run_in_executor(None, _fb_dl)
+            try:
+                fp,title = await asyncio.get_running_loop().run_in_executor(None, _fb_dl)
+            except Exception as e:
+                logger.error(f"[fb dl] {e}")
+                fp,title = None,None
         else:
             fp,title,tmp = await do_download(url,mt,ql,q.message.message_id,q.message.chat_id,ctx,q.message.message_id,is_photo)
 
-        if fp and os.path.exists(fp):
+        if fp and os.path.exists(fp) and os.path.getsize(fp) > TG_MAX_BYTES:
+            await em(f"❌ الملف أكبر من 50MB ({os.path.getsize(fp) // 1048576}MB) — حد تيليقرام للبوتات.\n• جرب جودة أقل")
+        elif fp and os.path.exists(fp):
             await em("📤 جاري الرفع...")
             try:
                 with open(fp,'rb') as f:
                     if mt=="audio": await ctx.bot.send_audio(q.message.chat_id,f,title=title or "audio")
-                    else: await ctx.bot.send_video(q.message.chat_id,f,caption=f"✅ {(title or '')[:200]}",supports_streaming=True)
+                    else: await send_safe(ctx.bot.send_video(q.message.chat_id,f,caption=f"✅ {(title or '')[:200]}",supports_streaming=True))
                 await q.message.delete()
             except Exception as e: await em(f"❌ فشل الرفع: {str(e)[:80]}")
         else:
@@ -1833,7 +1961,7 @@ async def btn_cb(upd, ctx):
                     else: await q.edit_message_text("❌ الملف ما يحتوي صوت.")
                     for p in [inp,out]:
                         try: os.remove(p)
-                        except: pass
+                        except Exception: pass
                 else: await q.edit_message_text("❌ ما لقيت الفيديو.")
             else: await q.edit_message_text("❌ ما لقيت الفيديو الأصلي.")
         except Exception as e: await q.edit_message_text(f"❌ خطأ: {str(e)[:80]}")
@@ -1922,7 +2050,7 @@ async def btn_cb(upd, ctx):
                 f"🎮 <b>إكس أو</b>\n👤 {q.from_user.first_name} ❌ vs 🤖 البوت ⭕\n\nدورك! اضغط خلية 👇",
                 parse_mode="HTML", reply_markup=ttt_kb(game['board'],gid)); return
 
-        # ضد لاعع مفتوح
+        # ضد لاعب مفتوح
         if parts[1]=='vspvp' and len(parts)>=3:
             gid=parts[2]; game=ctx.bot_data.get(f'ttt_{gid}')
             if not game: return await q.answer("اللعبة انتهت!")
@@ -1949,7 +2077,7 @@ async def btn_cb(upd, ctx):
             try:
                 xm=await ctx.bot.get_chat_member(q.message.chat_id,game['players']['X'])
                 xn=xm.user.first_name
-            except: xn="اللاعع الأول"
+            except Exception: xn="اللاعب الأول"
             await q.answer("✅ قبلت التحدي! ابدأوا!")
             await q.edit_message_text(
                 f"🎮 <b>إكس أو PvP</b>\n❌ {xn} vs ⭕ {q.from_user.first_name}\n\nدور ❌ {xn}!",
@@ -1976,7 +2104,7 @@ async def btn_cb(upd, ctx):
         if len(parts)<3: return await q.answer()
         gid=parts[1]
         try: cell=int(parts[2])
-        except: return await q.answer()
+        except Exception: return await q.answer()
         game=ctx.bot_data.get(f'ttt_{gid}')
         if not game: return await q.answer("اللعبة انتهت! ابدأ جديدة 🎮",show_alert=True)
 
@@ -2021,7 +2149,7 @@ async def btn_cb(upd, ctx):
             game['turn']='X'
         await q.answer()
         try: await q.edit_message_reply_markup(ttt_kb(game['board'],gid))
-        except: pass
+        except Exception: pass
         return
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2042,13 +2170,13 @@ async def cmd_admin_refresh(q):
                  InlineKeyboardButton("🍪 فحص كوكيز", callback_data="adm_cookies")])
     try:
         await q.edit_message_text(
-            f"⚙️ <b>لوحة تحكم المطور</b>\n\n"
-            f"<b>المنصات:</b>\n" + "\n".join(status_lines) + "\n\n"
+            "⚙️ <b>لوحة تحكم المطور</b>\n\n"
+            "<b>المنصات:</b>\n" + "\n".join(status_lines) + "\n\n"
             f"<b>🍪 الكوكيز:</b> {cookie_info}",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(rows)
         )
-    except: pass
+    except Exception: pass
 
 async def welcome_handler(upd, ctx):
     for m in upd.message.new_chat_members:
@@ -2085,7 +2213,7 @@ async def welcome_handler(upd, ctx):
             p=await ctx.bot.get_user_profile_photos(m.id,limit=1)
             if p.total_count>0: await ctx.bot.send_photo(upd.message.chat.id,p.photos[0][-1].file_id,caption=txt,parse_mode="HTML")
             else: await upd.message.reply_text(txt,parse_mode="HTML")
-        except: await upd.message.reply_text(txt,parse_mode="HTML")
+        except Exception: await upd.message.reply_text(txt,parse_mode="HTML")
 
 async def edit_handler(upd, ctx):
     if not upd.edited_message: return
@@ -2109,11 +2237,11 @@ async def media_filter(upd, ctx):
     elif msg.photo and s.get("ban_photos"): reason="الصور"
     if reason:
         try: await msg.delete()
-        except: pass
+        except Exception: pass
         try:
             nm=await ctx.bot.send_message(msg.chat_id,f"🚫 {msg.from_user.first_name}، إرسال {reason} ممنوع هنا!")
             await asyncio.sleep(4); await nm.delete()
-        except: pass
+        except Exception: pass
 
 async def track_msg(upd, ctx):
     if not upd.message or not upd.message.text or upd.message.text.startswith('/'): return
@@ -2138,7 +2266,7 @@ async def handle_msg(upd, ctx):
             markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔒 اقرأ الهمسة",callback_data=f"show_w_{wid}")]])
             try:
                 m=await ctx.bot.get_chat_member(wc,tid); tn=m.user.first_name
-            except: tn="العضو"
+            except Exception: tn="العضو"
             await ctx.bot.send_message(wc,
                 f"🤫 *همسة سرية!*\n👤 من: {msg.from_user.first_name}\n📨 إلى: {tn}\n\n_فقط المستهدف يقدر يقرأها_ 👇",
                 reply_markup=markup,parse_mode="Markdown")
@@ -2157,18 +2285,20 @@ async def handle_msg(upd, ctx):
         if mt: await tiktok_user_info(upd, ctx, mt.group(1), cid); return
 
         # روابط بالخاص
-        if re.search(r'music\.youtube\.com',text,re.I): await music_handler(upd,ctx,re.search(r'https?://\S+',text).group(),cid,"🎵"); return
-        if re.search(r'soundcloud\.com',text,re.I): await music_handler(upd,ctx,re.search(r'https?://\S+',text).group(),cid,"🎶"); return
-        if re.search(r'spotify\.com',text,re.I): await spotify_handler(upd,ctx,re.search(r'https?://\S+',text).group(),cid); return
-        if re.search(r'threads\.net',text,re.I): await auto_download(upd,ctx,re.search(r'https?://\S+',text).group(),cid,"🧵"); return
-        if re.search(r'(youtube\.com|youtu\.be|shorts)',text,re.I): await yt_handler(upd,ctx,re.search(r'https?://\S+',text).group(),uid); return
-        if re.search(r'(x\.com|twitter\.com)',text,re.I): await x_handler(upd,ctx,re.search(r'https?://\S+',text).group(),uid); return
-        if re.search(r'(tiktok\.com|vm\.tiktok\.com|douyin\.com)',text,re.I): await tiktok_handler(upd,ctx,re.search(r'https?://\S+',text).group(),cid,msg.message_id); return
-        if re.search(r'(facebook\.com|fb\.watch|fb\.com)',text,re.I): await fb_handler(upd,ctx,re.search(r'https?://\S+',text).group(),uid); return
-        if re.search(r'(pinterest\.com|pin\.it)',text,re.I): await pinterest_handler(upd,ctx,re.search(r'https?://\S+',text).group(),cid); return  # auto best
+        url = find_url(text)
+        if url:
+            if host_in(url,'music.youtube.com'): await music_handler(upd,ctx,url,cid,"🎵"); return
+            if host_in(url,'soundcloud.com'): await music_handler(upd,ctx,url,cid,"🎶"); return
+            if host_in(url,'spotify.com'): await spotify_handler(upd,ctx,url,cid); return
+            if host_in(url,'threads.net'): await auto_download(upd,ctx,url,cid,"🧵"); return
+            if host_in(url,'youtube.com','youtu.be'): await yt_handler(upd,ctx,url,uid); return
+            if host_in(url,'x.com','twitter.com'): await x_handler(upd,ctx,url,uid); return
+            if host_in(url,'tiktok.com','douyin.com'): await tiktok_handler(upd,ctx,url,cid,msg.message_id); return
+            if host_in(url,'facebook.com','fb.watch','fb.com'): await fb_handler(upd,ctx,url,uid); return
+            if host_in(url,'pinterest.com','pin.it'): await pinterest_handler(upd,ctx,url,cid); return  # auto best
         m=re.match(r'^ستوري\s+@?(\S+)',text,re.I)
         if m: await insta_stories_handler(upd,ctx,m.group(1),cid); return
-        if re.search(r'instagram\.com',text,re.I): await insta_handler(upd,ctx,re.search(r'https?://\S+',text).group(),cid); return
+        if url and host_in(url,'instagram.com'): await insta_handler(upd,ctx,url,cid); return
 
         # تحويل فيديو لصوت بالخاص
         if text == "تحويل":
@@ -2202,7 +2332,7 @@ async def handle_msg(upd, ctx):
                 for p in [inp, out]:
                     try:
                         if os.path.exists(p): os.remove(p)
-                    except: pass
+                    except Exception: pass
             return
 
         # ترجمة + حاسبة بالخاص
@@ -2221,11 +2351,11 @@ async def handle_msg(upd, ctx):
             expr = text[5:].strip()
             try:
                 allowed = set('0123456789+-*/.() %')
-                if all(c in allowed or c.isspace() for c in expr):
+                if len(expr) <= 50 and '**' not in expr and all(c in allowed or c.isspace() for c in expr):
                     res = eval(expr,{"__builtins__":{}},{"sqrt":math.sqrt,"pi":math.pi,"abs":abs})
                     return await msg.reply_text(f"🔢 <code>{expr}</code> = <b>{res}</b>", parse_mode="HTML")
-                return await msg.reply_text("❗ أرقام وعمليات فقط (+، -، *، /)")
-            except: return await msg.reply_text("❌ معادلة غلط. مثال: <code>حساب 15 * 3 + 7</code>", parse_mode="HTML")
+                return await msg.reply_text("❗ أرقام وعمليات فقط (+، -، *، /) بدون أس، وبحد أقصى 50 حرف.")
+            except Exception: return await msg.reply_text("❌ معادلة غلط. مثال: <code>حساب 15 * 3 + 7</code>", parse_mode="HTML")
 
         if not text.startswith('/'):
             if ctx.user_data.get('ai', False):
@@ -2257,11 +2387,11 @@ async def handle_msg(upd, ctx):
     for w in s.get("banned_words",[]):
         if w and w.lower() in text.lower():
             try: await msg.delete()
-            except: pass
+            except Exception: pass
             try:
                 nm=await ctx.bot.send_message(cid,f"⚠️ {msg.from_user.first_name}، الرسالة تحتوي كلمة ممنوعة.")
                 await asyncio.sleep(4); await nm.delete()
-            except: pass
+            except Exception: pass
             return
 
     # ══ أوامر عامة ══
@@ -2283,7 +2413,7 @@ async def handle_msg(upd, ctx):
         if src:
             await ctx.bot.send_chat_action(cid,'typing')
             def _tr():
-                r=requests.get(f"https://api.mymemory.translated.net/get",params={"q":src,"langpair":"autodetect|ar"},timeout=10)
+                r=requests.get("https://api.mymemory.translated.net/get",params={"q":src,"langpair":"autodetect|ar"},timeout=10)
                 return r.json().get("responseData",{}).get("translatedText","فشلت الترجمة")
             result=await asyncio.get_running_loop().run_in_executor(None,_tr)
             return await msg.reply_text(f"🌐 <b>الترجمة:</b>\n{result}",parse_mode="HTML")
@@ -2292,11 +2422,11 @@ async def handle_msg(upd, ctx):
         expr=text[5:].strip()
         try:
             allowed=set('0123456789+-*/.() %')
-            if all(c in allowed or c.isspace() for c in expr):
+            if len(expr) <= 50 and '**' not in expr and all(c in allowed or c.isspace() for c in expr):
                 res=eval(expr,{"__builtins__":{}},{"sqrt":math.sqrt,"pi":math.pi})
                 return await msg.reply_text(f"🔢 <code>{expr}</code> = <b>{res}</b>",parse_mode="HTML")
-            else: return await msg.reply_text("❗ أرقام وعمليات فقط (+، -، *، /، ^)")
-        except: return await msg.reply_text("❌ معادلة غلط. مثال: <code>حساب 15 * 3 + 7</code>",parse_mode="HTML")
+            else: return await msg.reply_text("❗ أرقام وعمليات فقط (+، -، *، /) بدون أس، وبحد أقصى 50 حرف.")
+        except Exception: return await msg.reply_text("❌ معادلة غلط. مثال: <code>حساب 15 * 3 + 7</code>",parse_mode="HTML")
 
     if text=="افتار":
         t=msg.reply_to_message.from_user if msg.reply_to_message else msg.from_user
@@ -2374,7 +2504,7 @@ async def handle_msg(upd, ctx):
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🤖 ضد البوت",callback_data=f"ttt_vsbot_{gid}"),
-                    InlineKeyboardButton("👥 ضد لاعع",callback_data=f"ttt_vspvp_{gid}")
+                    InlineKeyboardButton("👥 ضد لاعب",callback_data=f"ttt_vspvp_{gid}")
                 ]]))
 
     # زواج
@@ -2395,7 +2525,7 @@ async def handle_msg(upd, ctx):
         try:
             m=await ctx.bot.get_chat_member(cid,pid)
             return await msg.reply_text(f"💑 شريكك: <b>{m.user.first_name}</b>",parse_mode="HTML")
-        except: return await msg.reply_text("شريكك غادر المجموعة 😔")
+        except Exception: return await msg.reply_text("شريكك غادر المجموعة 😔")
 
     # ══ إدارة (مدير+) ══
     if priv_mgr:
@@ -2404,7 +2534,7 @@ async def handle_msg(upd, ctx):
             w=db_get(f"warns/{cid}/{t.id}",0)+1; db_set(f"warns/{cid}/{t.id}",w)
             if w>=3:
                 try: await ctx.bot.ban_chat_member(cid,t.id)
-                except: pass
+                except Exception: pass
                 return await msg.reply_text(f"🚫 <b>{t.first_name}</b> تحذير 3/3 — تم الحظر!",parse_mode="HTML")
             return await msg.reply_text(f"⚠️ تحذير <b>{w}/3</b> لـ {t.first_name}",parse_mode="HTML")
         if text=="الغاء تحذير" and msg.reply_to_message:
@@ -2461,9 +2591,9 @@ async def handle_msg(upd, ctx):
                 dl=0
                 for mid in range(start,start+count+1):
                     try: await ctx.bot.delete_message(cid,mid); dl+=1
-                    except: pass
+                    except Exception: pass
                 try: await msg.delete()
-                except: pass
+                except Exception: pass
                 nm=await ctx.bot.send_message(cid,f"🗑 تم حذف {dl} رسالة.")
                 await asyncio.sleep(3); await nm.delete()
             except ValueError: await msg.reply_text("❗ مثال: <code>مسح 10</code>",parse_mode="HTML")
@@ -2526,14 +2656,16 @@ async def handle_msg(upd, ctx):
     # روابط في الكروب
     mt = re.match(r'^تيك\s+@?(\S+)', text, re.I)
     if mt: await tiktok_user_info(upd, ctx, mt.group(1), cid); return
-    if re.search(r'(youtube\.com|youtu\.be|shorts)',text,re.I): await yt_handler(upd,ctx,re.search(r'https?://\S+',text).group(),uid); return
-    if re.search(r'(x\.com|twitter\.com)',text,re.I): await x_handler(upd,ctx,re.search(r'https?://\S+',text).group(),uid); return
-    if re.search(r'(tiktok\.com|vm\.tiktok\.com|douyin\.com)',text,re.I): await tiktok_handler(upd,ctx,re.search(r'https?://\S+',text).group(),cid,msg.message_id); return
-    if re.search(r'(facebook\.com|fb\.watch|fb\.com)',text,re.I): await fb_handler(upd,ctx,re.search(r'https?://\S+',text).group(),uid); return
-    if re.search(r'(pinterest\.com|pin\.it)',text,re.I): await pinterest_handler(upd,ctx,re.search(r'https?://\S+',text).group(),cid); return
+    url = find_url(text)
+    if url:
+        if host_in(url,'youtube.com','youtu.be'): await yt_handler(upd,ctx,url,uid); return
+        if host_in(url,'x.com','twitter.com'): await x_handler(upd,ctx,url,uid); return
+        if host_in(url,'tiktok.com','douyin.com'): await tiktok_handler(upd,ctx,url,cid,msg.message_id); return
+        if host_in(url,'facebook.com','fb.watch','fb.com'): await fb_handler(upd,ctx,url,uid); return
+        if host_in(url,'pinterest.com','pin.it'): await pinterest_handler(upd,ctx,url,cid); return
     m=re.match(r'^ستوري\s+@?(\S+)',text,re.I)
     if m: await insta_stories_handler(upd,ctx,m.group(1),cid); return
-    if re.search(r'instagram\.com',text,re.I): await insta_handler(upd,ctx,re.search(r'https?://\S+',text).group(),cid); return
+    if url and host_in(url,'instagram.com'): await insta_handler(upd,ctx,url,cid); return
 
     # ذكاء اصطناعي في الكروب
     if s.get("ai_mode"):
@@ -2589,13 +2721,21 @@ def main():
     if not token:
         logger.error("❌ BOT_TOKEN not set! Add it as environment variable.")
         return
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .connect_timeout(30)
+        .read_timeout(120)
+        .write_timeout(300)   # الأهم: رفع الملفات
+        .pool_timeout(30)
+        .build()
+    )
     app.add_handler(CommandHandler("start",cmd_start))
     app.add_handler(CommandHandler("admin",cmd_admin))
     app.add_handler(CommandHandler("help",cmd_help))
     app.add_handler(CommandHandler("ping",cmd_ping))
     app.add_handler(CommandHandler("id",cmd_id))
-    app.add_handler(CallbackQueryHandler(btn_cb,pattern=r"^(show_w_|cmd_|dl_|ttt_|convert_|ist_)"))
+    app.add_handler(CallbackQueryHandler(btn_cb,pattern=r"^(show_w_|cmd_|dl_|ttt_|convert_|ist_|adm_)"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS,welcome_handler))
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.TEXT,edit_handler))
     # تحويل الفيديو المُرسل مباشرة بالخاص
