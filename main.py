@@ -3106,6 +3106,8 @@ def main():
     async def _post_init(app):
         asyncio.create_task(_keep_alive(app))
     app.post_init = _post_init
+    # بايثون 3.14+ ما عاد ينشئ event loop تلقائياً، وإصدارات PTB القديمة تحتاج واحد جاهز
+    asyncio.set_event_loop(asyncio.new_event_loop())
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
