@@ -1,12 +1,13 @@
 import logging, os, asyncio, random, re, hashlib, requests, time
 import tempfile, shutil, subprocess, sqlite3, json, threading, math
 import datetime as _dt
+import contextvars, io
 from concurrent.futures import ThreadPoolExecutor
-from html import escape as _esc
+from html import escape as _esc, unescape as _unesc
 from urllib.parse import urlparse
-from telegram import ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
-from telegram.error import TimedOut, InvalidToken, TelegramError
-from telegram.ext import Application, MessageHandler, CallbackQueryHandler, CommandHandler, filters
+from telegram import Update, ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+from telegram.error import TimedOut, InvalidToken, TelegramError, RetryAfter, BadRequest, Forbidden
+from telegram.ext import Application, MessageHandler, CallbackQueryHandler, CommandHandler, TypeHandler, ApplicationHandlerStop, filters
 from yt_dlp import YoutubeDL
 import imageio_ffmpeg
 
@@ -54,6 +55,8 @@ async def platform_blocked(upd, name: str) -> bool:
     """True إذا المنصة موقوفة من لوحة المطور (ويرسل رسالة الصيانة)."""
     if platform_enabled(name):
         return False
+    _ll = _cur_ll.get()
+    if _ll is not None: _ll.blocked = True
     msg = upd.message
     dev = bool(msg and msg.from_user and is_dev(msg.from_user))
     await msg.reply_text(
@@ -62,15 +65,28 @@ async def platform_blocked(upd, name: str) -> bool:
     )
     return True
 
+_cur_ll = contextvars.ContextVar('cur_ll', default=None)
+
+def _ll_ok():
+    ll = _cur_ll.get()
+    if ll is not None: ll.mark_ok()
+
+def _ll_fail(reason: str):
+    ll = _cur_ll.get()
+    if ll is not None: ll.mark_fail(reason)
+
 async def send_safe(coro):
     """
     TimedOut أثناء رفع ملف غالباً يعني أن تيليقرام استلم الملف فعلاً وراح يوصله،
     فما نعتبره فشل (حتى ما تطلع رسالة خطأ والمقطع جاي).
     """
     try:
-        return await coro
+        r = await coro
+        _ll_ok()
+        return r
     except TimedOut:
         logger.warning("[send_safe] TimedOut — الملف غالباً وصل لتيليقرام")
+        _ll_ok()
         return None
 
 async def send_error(ctx, chat_id, user, dev_msg: str, user_msg: str = None,
@@ -83,6 +99,7 @@ async def send_error(ctx, chat_id, user, dev_msg: str, user_msg: str = None,
     target_message: إذا فيه رسالة "جاري التحميل..." موجودة، نعدّلها بدل إرسال رسالة جديدة.
     """
     is_developer = is_dev(user) if user else False
+    _ll_fail(_unesc(re.sub(r'<[^>]+>', '', dev_msg or '')).replace('⚙️ [DEV]', '').strip()[:300] or 'خطأ')
     final_text = dev_msg if is_developer else (user_msg or T('error_generic'))
 
     sent_msg = None
@@ -304,6 +321,25 @@ def _load_cookies():
         logger.error("❌ Failed to load cookies from COOKIES_DATA")
 _load_cookies()
 
+def db_list(prefix: str) -> dict:
+    """{path: value} لكل المفاتيح اللي تبدأ بـ prefix (من القاعدة مباشرة)."""
+    out = {}
+    try:
+        if DB_BACKEND == "mongo":
+            _io_pool.submit(lambda: None).result()      # تأكد أن الكتابات المعلقة انحفظت
+            for doc in _mongo_kv.find({'_id': {'$regex': '^' + re.escape(prefix)}}):
+                try: out[doc['_id']] = json.loads(doc['value'])
+                except Exception: pass
+        else:
+            like = prefix.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+            with sqlite3.connect(DB_PATH) as c:
+                for path, val in c.execute("SELECT path, value FROM kv WHERE path LIKE ? ESCAPE '\\'", (like,)):
+                    try: out[path] = json.loads(val)
+                    except Exception: pass
+    except Exception as e:
+        logger.error(f"[db_list] {prefix}: {e}")
+    return out
+
 _UNSET = object()
 _cache: dict = {}    # path -> نص JSON أو None (غير موجود) — البوت هو الكاتب الوحيد فالكاش دقيق
 
@@ -463,6 +499,39 @@ TEXTS = {
     },
 }
 
+TEXTS.update({
+    'maint_bot': {
+        'label': '🔧 رسالة صيانة البوت',
+        'vars': {},
+        'default': "🔧 البوت تحت الصيانة حالياً، نرجع قريباً إن شاء الله 🌸",
+    },
+    'pw_prompt': {
+        'label': '🔐 رسالة طلب الباسورد',
+        'vars': {},
+        'default': "🔐 <b>البوت محمي بكلمة مرور</b>\n\nاكتب كلمة المرور (4 أرقام) للمتابعة.",
+    },
+    'pw_wrong': {
+        'label': '❌ رسالة الباسورد الخاطئ',
+        'vars': {'left': 'عدد المحاولات المتبقية'},
+        'default': "❌ كلمة المرور غلط. باقي لك <b>{left}</b> محاولات.",
+    },
+    'pw_correct': {
+        'label': '✅ رسالة الباسورد الصحيح',
+        'vars': {},
+        'default': "✅ كلمة المرور صحيحة! أهلاً بيك 🎉",
+    },
+    'pw_blocked': {
+        'label': '🚫 رسالة الحظر المؤقت',
+        'vars': {'minutes': 'الدقائق المتبقية'},
+        'default': "🚫 كثرت المحاولات الغلط. حاول بعد <b>{minutes}</b> دقيقة.",
+    },
+    'pw_hint': {
+        'label': '💡 تلميح الباسورد (زر «الباسورد»)',
+        'vars': {},
+        'default': "💡 ما حدد المطور تلميح بعد.",
+    },
+})
+
 def T(key, **values):
     """نص الرسالة: المعدّل من لوحة الأدمن إن وُجد، وإلا الافتراضي."""
     txt = db_get(f"texts/{key}") or TEXTS[key]['default']
@@ -485,16 +554,58 @@ def _spawn(coro):
     _bg_tasks.add(t)
     t.add_done_callback(_bg_tasks.discard)
 
-async def _notify_new_user(ctx, u, total, dev_chat):
+try:    # PTB >= 20.8
+    from telegram import LinkPreviewOptions
+    _NO_PREVIEW_KW = {'link_preview_options': LinkPreviewOptions(is_disabled=True)}
+except ImportError:    # إصدارات أقدم
+    _NO_PREVIEW_KW = {'disable_web_page_preview': True}
+
+def _dev_chat():
+    v = os.environ.get('DEV_CHAT_ID') or cfg_get('dev_chat_id')
+    try: return int(v) if v else None
+    except (TypeError, ValueError): return None
+
+def _channel_id():
+    v = cfg_get('channel_id')
+    return None if v in (None, '') else v
+
+def _user_block(u):
+    full = ' '.join(x for x in [getattr(u, 'first_name', None), getattr(u, 'last_name', None)] if x) or '—'
+    uname = f"@{_esc(u.username)}" if getattr(u, 'username', None) else "لا يوجد"
+    return (f"👤 <b>الاسم:</b> <a href=\"tg://user?id={u.id}\">{_esc(full)}</a>\n"
+            f"🆔 <b>الآيدي:</b> <code>{u.id}</code>\n"
+            f"📛 <b>اليوزر:</b> {uname}")
+
+async def _send_to(bot, target, text, photo_id=None):
+    if photo_id: return await bot.send_photo(target, photo_id, caption=text, parse_mode="HTML")
+    return await bot.send_message(target, text, parse_mode="HTML", **_NO_PREVIEW_KW)
+
+async def notify_admin(ctx, text, photo_id=None):
+    """للقناة إن وُجدت. إذا فشلت (أو ما فيه قناة) يرجع للمطور بالخاص."""
+    ch = _channel_id()
+    if ch is not None:
+        try:
+            await _send_to(ctx.bot, ch, text, photo_id)
+            return True
+        except Exception as e:
+            logger.warning(f"[notify_admin] القناة فشلت: {type(e).__name__}: {e}")
+    dev = _dev_chat()
+    if dev:
+        try:
+            await _send_to(ctx.bot, dev, text, photo_id)
+            return True
+        except Exception as e:
+            logger.warning(f"[notify_admin] الخاص فشل: {type(e).__name__}: {e}")
+    else:
+        logger.warning("[notify_admin] ما أعرف وين أرسل — حدد القناة أو اكتب /start من حساب المطور")
+    return False
+
+async def _notify_new_user(ctx, u, total):
     try:
-        full = ' '.join(x for x in [u.first_name, getattr(u, 'last_name', None)] if x) or '—'
-        uname = f"@{_esc(u.username)}" if u.username else "لا يوجد"
         caption = (
             "🆕 <b>مستخدم جديد ضغط /start</b>\n\n"
-            f"👤 <b>الاسم:</b> <a href=\"tg://user?id={u.id}\">{_esc(full)}</a>\n"
-            f"🆔 <b>الآيدي:</b> <code>{u.id}</code>\n"
-            f"📛 <b>اليوزر:</b> {uname}\n"
-            f"🌐 <b>اللغة:</b> {_esc(u.language_code or '—')}\n"
+            f"{_user_block(u)}\n"
+            f"🌐 <b>اللغة:</b> {_esc(getattr(u, 'language_code', None) or '—')}\n"
             f"👥 <b>إجمالي المستخدمين:</b> {total}"
         )
         photo_id = None
@@ -503,31 +614,260 @@ async def _notify_new_user(ctx, u, total, dev_chat):
             if ph.total_count > 0: photo_id = ph.photos[0][-1].file_id
         except Exception as e:
             logger.info(f"[new_user] no profile photo: {e}")
-        if photo_id: await ctx.bot.send_photo(dev_chat, photo_id, caption=caption, parse_mode="HTML")
-        else: await ctx.bot.send_message(dev_chat, caption, parse_mode="HTML")
+        await notify_admin(ctx, caption, photo_id)
     except Exception as e:
         logger.warning(f"[notify_new_user] {e}")
 
-async def register_user(upd, ctx):
-    """يسجّل المستخدم أول مرة ويبلّغ المطور (صورة + اسم + ايدي + يوزر). المطور نفسه: يحفظ chat_id فقط."""
+def _register_silent(u) -> bool:
+    """يسجّل/يحدّث المستخدم بدون إشعار. True إذا كان جديد. (المطور ما ينسجل)"""
+    if u is None or getattr(u, 'is_bot', False) or is_dev(u): return False
+    full = ' '.join(x for x in [getattr(u, 'first_name', None), getattr(u, 'last_name', None)] if x)
+    rec = db_get(f"users/{u.id}")
+    if rec is None:
+        db_set(f"users/{u.id}", {'name': full, 'username': u.username, 'ts': int(time.time())})
+        cfg_set('users_count', int(cfg_get('users_count', 0) or 0) + 1)
+        return True
+    if rec.get('name') != full or rec.get('username') != u.username:
+        rec['name'] = full; rec['username'] = u.username
+        db_set(f"users/{u.id}", rec)
+    return False
+
+async def register_user(upd, ctx, notify=False):
+    """بالخاص: يسجّل المستخدم، وإذا جديد + notify (أول /start) يبلّغ المطور. المطور نفسه: يحفظ chat_id فقط."""
     try:
-        msg = upd.message; u = msg.from_user
-        if msg.chat.type != 'private' or u.is_bot: return
+        u = upd.effective_user; chat = upd.effective_chat
+        if u is None or chat is None or chat.type != 'private' or getattr(u, 'is_bot', False): return
         if is_dev(u):
-            if cfg_get('dev_chat_id') != msg.chat_id: cfg_set('dev_chat_id', msg.chat_id)
+            if cfg_get('dev_chat_id') != chat.id: cfg_set('dev_chat_id', chat.id)
             return
-        if db_get(f"users/{u.id}") is not None: return
-        db_set(f"users/{u.id}", {'name': u.first_name, 'username': u.username, 'ts': int(time.time())})
-        total = int(cfg_get('users_count', 0) or 0) + 1
-        cfg_set('users_count', total)
+        is_new = _register_silent(u)
+        if not (is_new and notify): return
         if not cfg_get('notify_new_users', True): return
-        dev_chat = os.environ.get('DEV_CHAT_ID') or cfg_get('dev_chat_id')
-        if not dev_chat:
-            logger.warning("[new_user] ما أعرف chat_id المطور — اكتب /start مرة وحدة من حسابك")
+        if _channel_id() is None and not _dev_chat():
+            logger.warning("[new_user] ما أعرف وين أبلّغ — حدد القناة أو اكتب /start من حساب المطور")
             return
-        _spawn(_notify_new_user(ctx, u, total, int(dev_chat)))
+        _spawn(_notify_new_user(ctx, u, int(cfg_get('users_count', 0) or 0)))
     except Exception as e:
         logger.warning(f"[register_user] {e}")
+
+# ── سجل الروابط بالقناة ──
+PLATFORM_LABEL = {
+    'youtube': '🎬 يوتيوب', 'youtube music': '🎵 يوتيوب ميوزك', 'soundcloud': '🎶 ساوند كلاود',
+    'spotify': '🎧 سبوتيفاي', 'threads': '🧵 ثريدز', 'x': '🐦 X/تويتر', 'tiktok': '🎵 تيك توك/دوين',
+    'facebook': '📘 فيس بوك', 'pinterest': '📌 بينترست', 'instagram': '📸 انستغرام',
+}
+
+async def _tg_retry(fn, *a, **k):
+    for attempt in range(2):
+        try:
+            return await fn(*a, **k)
+        except RetryAfter as e:
+            if attempt == 1: raise
+            ra = e.retry_after
+            await asyncio.sleep(min(float(ra.total_seconds() if hasattr(ra, 'total_seconds') else ra), 30))
+
+class LinkLog:
+    """رسالة بالقناة لكل رابط: معلومات المستخدم + المنصة + الرابط + الحالة (تتعدل بنفس الرسالة)."""
+    def __init__(self, ctx, user, chat, platform, url):
+        self.ctx, self.bot = ctx, ctx.bot
+        self.user, self.chat, self.platform, self.url = user, chat, platform, url
+        self.t0 = time.time()
+        self.ok = False; self.blocked = False; self.pending = False
+        self.fail_reason = None
+        self.msg_ref = None
+        self._task = None
+
+    def _text(self, status):
+        src = "💬 خاص" if self.chat.type == 'private' else f"👥 كروب: «{_esc(getattr(self.chat, 'title', '') or '')}»"
+        label = PLATFORM_LABEL.get(self.platform, self.platform)
+        return (f"🔗 <b>رابط جديد</b>\n\n{_user_block(self.user)}\n"
+                f"📍 <b>المصدر:</b> {src}\n"
+                f"🎯 <b>المنصة:</b> {label}\n"
+                f"🔗 <b>الرابط:</b> {_esc(self.url[:500])}\n\n"
+                f"📊 <b>الحالة:</b> {status}")
+
+    def start(self):
+        self._task = asyncio.ensure_future(self._send_initial())
+        _bg_tasks.add(self._task); self._task.add_done_callback(_bg_tasks.discard)
+
+    async def _send_initial(self):
+        ch = _channel_id()
+        try:
+            m = await _tg_retry(self.bot.send_message, ch, self._text("⏳ جاري التحميل..."),
+                                parse_mode="HTML", **_NO_PREVIEW_KW)
+            self.msg_ref = (m.chat_id, m.message_id)
+        except Exception as e:
+            logger.warning(f"[linklog] send failed: {type(e).__name__}: {e}")
+
+    def mark_ok(self): self.ok = True
+    def mark_fail(self, reason): self.fail_reason = (reason or 'خطأ')[:300]
+    def set_pending(self): self.pending = True
+
+    def status_text(self):
+        dur = time.time() - self.t0
+        if self.ok: return f"✅ تم التحميل ({dur:.1f} ث)"
+        if self.blocked: return "⛔ المنصة موقوفة من الأدمن"
+        if self.fail_reason: return f"❌ فشل: {_esc(self.fail_reason)}"
+        if self.pending: return "⏳ بانتظار اختيار المستخدم (الجودة/الصيغة)"
+        return "❌ فشل (بدون تفاصيل)"
+
+    async def finish(self):
+        if self.ok or self.fail_reason: self.pending = False
+        try:
+            if self._task is not None: await self._task
+            if not self.msg_ref: return
+            await _tg_retry(self.bot.edit_message_text, chat_id=self.msg_ref[0], message_id=self.msg_ref[1],
+                            text=self._text(self.status_text()), parse_mode="HTML", **_NO_PREVIEW_KW)
+        except BadRequest as e:
+            if 'not modified' not in str(e).lower(): logger.info(f"[linklog] edit: {e}")
+        except Exception as e:
+            logger.warning(f"[linklog] edit failed: {type(e).__name__}: {e}")
+
+    def finish_bg(self): _spawn(self.finish())
+
+class ll_scope:
+    """يربط تنفيذ (مثل ضغطة زر جودة) بسجل رابط موجود، ويحدّث حالته بالنهاية."""
+    def __init__(self, ll): self.ll = ll; self.tok = None
+    async def __aenter__(self):
+        if self.ll is not None:
+            self.ll.t0 = time.time(); self.tok = _cur_ll.set(self.ll)
+        return self.ll
+    async def __aexit__(self, et, ev, tb):
+        if self.tok is not None:
+            _cur_ll.reset(self.tok)
+            if ev is not None: self.ll.mark_fail(f"{type(ev).__name__}: {ev}")
+            self.ll.finish_bg()
+        return False
+
+def linklog_start(ctx, upd, platform, url):
+    try:
+        u = upd.effective_user; c = upd.effective_chat
+        if u is None or c is None or is_dev(u): return None          # روابط المطور ما تنسجل
+        if not cfg_get('linklog_on', True) or _channel_id() is None: return None
+        ll = LinkLog(ctx, u, c, platform, url); ll.start()
+        return ll
+    except Exception as e:
+        logger.warning(f"[linklog_start] {e}")
+        return None
+
+async def run_logged(upd, ctx, platform, url, handler, *args):
+    """ينفّذ معالج الرابط، ويسجل المستخدم (للكروبات)، ويكتب سجل الرابط بالقناة."""
+    try: _register_silent(upd.effective_user)
+    except Exception as e: logger.warning(f"[run_logged] register: {e}")
+    ll = linklog_start(ctx, upd, platform, url)
+    if ll is None:
+        return await handler(*args)
+    tok = _cur_ll.set(ll)
+    try:
+        return await handler(*args)
+    except Exception as e:
+        ll.mark_fail(f"{type(e).__name__}: {e}")
+        raise
+    finally:
+        _cur_ll.reset(tok)
+        ll.finish_bg()
+
+# ── الصيانة + بوابة الباسورد ──
+_maint_last = {}
+_pw_notify_ts = {}
+_ARABIC_DIGITS = str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789')
+PW_MAX_TRIES = 5
+PW_BLOCK_MIN = 15
+
+def _plain(html_text, limit=200):
+    return _unesc(re.sub(r'<[^>]+>', '', html_text or ''))[:limit]
+
+def _pw_on(): return bool(cfg_get('pw_enabled', False)) and bool(cfg_get('pw_value', ''))
+def _pw_gen(): return int(cfg_get('pw_gen', 1) or 1)
+def _pw_authorized(uid):
+    if uid in (cfg_get('pw_exempt', []) or []): return True
+    return db_get(f"pwok/{uid}") == _pw_gen()
+
+def _pw_prompt_markup():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔑 الباسورد", callback_data="pw_hint")]])
+
+async def _pw_show_hint(q, ctx):
+    hint = T('pw_hint')
+    plain = _plain(hint, 1000)
+    if len(plain) <= 200:
+        await q.answer(plain, show_alert=True)
+    else:
+        await q.answer()
+        await ctx.bot.send_message(q.message.chat_id, hint, parse_mode="HTML")
+
+async def _notify_pw(ctx, u, kind, n=None):
+    titles = {'ok': "✅ <b>دخل بالباسورد الصحيح</b>",
+              'wrong': "❌ <b>محاولة باسورد خاطئة</b>",
+              'blocked': f"🚫 <b>انحظر {PW_BLOCK_MIN} دقيقة (محاولات خاطئة)</b>"}
+    text = titles[kind] + "\n\n" + _user_block(u)
+    if kind == 'wrong': text += f"\n🔢 <b>المحاولة:</b> {n}/{PW_MAX_TRIES}"
+    await notify_admin(ctx, text)
+
+async def _pw_gate(upd, ctx, u, msg, q, text) -> bool:
+    """True إذا التحديث انصرف (ما يكمل للمعالجات)."""
+    if q:
+        if q.data == 'pw_hint': await _pw_show_hint(q, ctx)
+        else: await q.answer("🔒 اكتب كلمة المرور أولاً", show_alert=True)
+        return True
+    if not msg: return True
+    if text.startswith('/start w_'): return False          # الهمسات تعدي
+    now = time.time()
+    rec = db_get(f"pw_fail/{u.id}") or {'n': 0, 'until': 0}
+    if rec.get('until', 0) > now:
+        mins = max(1, int((rec['until'] - now + 59) // 60))
+        await msg.reply_text(T('pw_blocked', minutes=mins), parse_mode="HTML")
+        return True
+    if rec.get('until', 0): rec = {'n': 0, 'until': 0}      # انتهى الحظر
+    digits = text.translate(_ARABIC_DIGITS)
+    if not re.fullmatch(r'\d{4}', digits):
+        await msg.reply_text(T('pw_prompt'), parse_mode="HTML", reply_markup=_pw_prompt_markup())
+        return True
+    if digits == str(cfg_get('pw_value', '')):
+        db_set(f"pwok/{u.id}", _pw_gen()); db_set(f"pw_fail/{u.id}", None)
+        await msg.reply_text(T('pw_correct'), parse_mode="HTML")
+        _spawn(_notify_pw(ctx, u, 'ok'))
+        await msg.reply_text(T('start_private', name=_esc(u.first_name or '')), parse_mode="HTML")
+        return True
+    rec['n'] = int(rec.get('n', 0)) + 1
+    if rec['n'] >= PW_MAX_TRIES:
+        db_set(f"pw_fail/{u.id}", {'n': 0, 'until': now + PW_BLOCK_MIN * 60})
+        await msg.reply_text(T('pw_blocked', minutes=PW_BLOCK_MIN), parse_mode="HTML")
+        _spawn(_notify_pw(ctx, u, 'blocked'))
+    else:
+        db_set(f"pw_fail/{u.id}", rec)
+        await msg.reply_text(T('pw_wrong', left=PW_MAX_TRIES - rec['n']), parse_mode="HTML")
+        if now - _pw_notify_ts.get(u.id, 0) >= 15:           # مرة كل 15 ثانية للشخص
+            _pw_notify_ts[u.id] = now
+            _spawn(_notify_pw(ctx, u, 'wrong', rec['n']))
+    return True
+
+async def gate(upd, ctx):
+    """يشتغل قبل كل المعالجات: صيانة + باسورد. المطور يعدي دائماً."""
+    u = upd.effective_user; chat = upd.effective_chat
+    if u is None or chat is None: return
+    q = upd.callback_query; msg = upd.message
+    if is_dev(u):
+        if q and q.data == 'pw_hint':
+            await _pw_show_hint(q, ctx); raise ApplicationHandlerStop
+        if chat.type == 'private': await register_user(upd, ctx)
+        return
+    if cfg_get('maintenance', False):
+        try:
+            if q:
+                await q.answer(_plain(T('maint_bot')), show_alert=True)
+            elif msg and chat.type == 'private' and time.time() - _maint_last.get(u.id, 0) > 600:
+                _maint_last[u.id] = time.time()
+                await msg.reply_text(T('maint_bot'), parse_mode="HTML")
+        except Exception as e:
+            logger.info(f"[gate] maintenance reply: {e}")
+        raise ApplicationHandlerStop
+    if chat.type != 'private': return
+    text = (msg.text or '').strip() if msg else ''
+    await register_user(upd, ctx, notify=text.startswith('/start'))
+    if q and q.data == 'pw_hint' and not (_pw_on() and not _pw_authorized(u.id)):
+        await _pw_show_hint(q, ctx); raise ApplicationHandlerStop
+    if _pw_on() and not _pw_authorized(u.id):
+        if await _pw_gate(upd, ctx, u, msg, q, text): raise ApplicationHandlerStop
 
 # ── لوحة المطور ──
 ADMIN_PLATFORMS = ['youtube', 'instagram', 'tiktok', 'facebook', 'x', 'spotify', 'soundcloud', 'pinterest']
@@ -552,26 +892,107 @@ def admin_main(bot_username=None):
     status = [f"{'🟢' if platform_enabled(p) else '🔴'} {p}" for p in ADMIN_PLATFORMS]
     storage = "🟢 MongoDB (دائمة)" if DB_BACKEND == "mongo" else "🟠 SQLite محلي (يُمسح على Render المجاني)"
     warn = f"\n⚠️ {_esc(DB_WARNING)}" if DB_WARNING else ""
+    maint = bool(cfg_get('maintenance', False))
     text = (
         "⚙️ <b>لوحة تحكم المطور</b>\n\n"
         "<b>المنصات:</b>\n" + "\n".join(status) + "\n\n"
         f"<b>🍪 الكوكيز:</b> {_cookie_info()}\n"
         f"<b>💾 التخزين:</b> {storage}{warn}\n"
-        f"<b>🗑 مدة حفظ الرسائل:</b> {_fmt_hours(_retention_hours())}\n"
-        f"<b>👥 المستخدمين المسجلين:</b> {int(cfg_get('users_count', 0) or 0)}"
+        f"<b>📢 القناة:</b> {'✅ محددة' if _channel_id() is not None else '❌ غير محددة (الإشعارات للخاص)'}\n"
+        f"<b>🔧 الصيانة:</b> {'🔴 شغالة (البوت مقفول للمستخدمين)' if maint else '🟢 طبيعي'}\n"
+        f"<b>🔐 كلمة المرور:</b> {'✅ مفعّلة' if _pw_on() else '❌ مطفية'}\n"
+        f"<b>🗑 مدة حفظ الرسائل:</b> {_fmt_hours(_retention_hours())}"
     )
     if bot_username: text += f"\n<b>🤖 البوت:</b> @{bot_username}"
-    rows = []
-    for p in ADMIN_PLATFORMS:
-        on = platform_enabled(p)
-        rows.append([InlineKeyboardButton(f"{'🔴 وقف' if on else '🟢 شغّل'} {p}", callback_data=f"adm_toggle_{p}")])
+    btns = [InlineKeyboardButton(f"{'🔴 وقف' if platform_enabled(p) else '🟢 شغّل'} {p}", callback_data=f"adm_toggle_{p}")
+            for p in ADMIN_PLATFORMS]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
     rows.append([InlineKeyboardButton("🔄 تحديث", callback_data="adm_refresh"),
                  InlineKeyboardButton("🍪 فحص كوكيز", callback_data="adm_cookies")])
+    rows.append([InlineKeyboardButton("📢 القناة", callback_data="adm_chan"),
+                 InlineKeyboardButton("👥 المستخدمين", callback_data="adm_users")])
+    rows.append([InlineKeyboardButton("🔐 كلمة المرور", callback_data="adm_pw"),
+                 InlineKeyboardButton("🟢 أوقف الصيانة" if maint else "🔧 شغّل الصيانة", callback_data="adm_maint")])
     rows.append([InlineKeyboardButton("✏️ تعديل الرسائل", callback_data="adm_texts")])
     rows.append([InlineKeyboardButton(f"🗑 مدة حفظ الرسائل: {_fmt_hours(_retention_hours())}", callback_data="adm_ret")])
     rows.append([InlineKeyboardButton(f"🔔 إشعار المستخدمين الجدد: {'✅ شغال' if cfg_get('notify_new_users', True) else '❌ موقوف'}",
                                       callback_data="adm_newuser")])
     return text, InlineKeyboardMarkup(rows)
+
+async def _edit(q, text, rows):
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    except Exception as e:
+        logger.info(f"[admin edit] {e}")
+
+async def admin_show_channel(q, ctx):
+    ch = _channel_id()
+    title = ""
+    if ch is not None:
+        try: title = f" — <b>{_esc((await ctx.bot.get_chat(ch)).title or '')}</b>"
+        except Exception: title = " — ⚠️ ما كدرت أوصلها"
+    await _edit(q,
+        "📢 <b>قناة الإشعارات</b>\n\n"
+        f"<b>القناة:</b> {('<code>' + str(ch) + '</code>' + title) if ch is not None else '❌ غير محددة (الإشعارات تروح لخاصك)'}\n"
+        f"<b>🔗 سجل الروابط:</b> {'✅ شغال' if cfg_get('linklog_on', True) else '❌ موقوف'}\n\n"
+        "الإشعارات (مستخدم جديد، الباسورد، سجل الروابط) تروح للقناة. روابطك أنت ما تنسجل.",
+        [[InlineKeyboardButton("✏️ تعيين القناة", callback_data="adm_chanset"),
+          InlineKeyboardButton("🧪 تجربة", callback_data="adm_chantest")],
+         [InlineKeyboardButton(f"🔗 سجل الروابط: {'✅' if cfg_get('linklog_on', True) else '❌'}", callback_data="adm_linklog")],
+         [InlineKeyboardButton("🗑 إزالة القناة", callback_data="adm_chanclear")],
+         [InlineKeyboardButton("🔙 رجوع", callback_data="adm_refresh")]])
+
+def _users_all():
+    return db_list('users/')
+
+def _users_export_text(users: dict) -> str:
+    rows = []
+    for path, rec in users.items():
+        try: uid = int(path.split('/', 1)[1])
+        except Exception: continue
+        rows.append((rec.get('ts', 0), (rec.get('name') or '—').replace('\n', ' '),
+                     f"@{rec['username']}" if rec.get('username') else '—', uid))
+    rows.sort()
+    now = _dt.datetime.now(_dt.timezone.utc).strftime('%Y-%m-%d %H:%M')
+    lines = [f"مستخدمو البوت — العدد: {len(rows)}", f"التاريخ: {now} UTC", "─" * 28,
+             "الاسم | اليوزر | الآيدي", "─" * 28]
+    lines += [f"{n} | {un} | {uid}" for _, n, un, uid in rows]
+    return "\n".join(lines) + "\n"
+
+async def admin_show_users(q):
+    n = len(_users_all())
+    await _edit(q, f"👥 <b>مستخدمو البوت</b>\n\nالعدد: <b>{n}</b>",
+                [[InlineKeyboardButton("📄 تصدير ملف", callback_data="adm_usersexp")],
+                 [InlineKeyboardButton("🔙 رجوع", callback_data="adm_refresh")]])
+
+async def admin_show_pw(q):
+    on = _pw_on()
+    val = cfg_get('pw_value', '')
+    await _edit(q,
+        "🔐 <b>كلمة مرور البوت</b>\n\n"
+        f"<b>الحالة:</b> {'✅ مفعّلة' if on else '❌ مطفية'}\n"
+        f"<b>الباسورد الحالي:</b> {('<code>' + _esc(str(val)) + '</code>') if val else 'غير محدد'}\n"
+        f"<b>المستثنين:</b> {len(cfg_get('pw_exempt', []) or [])}\n\n"
+        "المستخدم لازم يدخلها مرة وحدة بأول استخدام بالخاص. الكروبات والهمسات ما تتأثر.",
+        [[InlineKeyboardButton("🟢 أطفئها" if on else "🔴 شغّلها", callback_data="adm_pwtoggle")],
+         [InlineKeyboardButton("🔑 تغيير الباسورد", callback_data="adm_pwset"),
+          InlineKeyboardButton("👤 المستثنين", callback_data="adm_pwex")],
+         [InlineKeyboardButton("✏️ رسائل الباسورد", callback_data="adm_textspw"),
+          InlineKeyboardButton("🔒 قفل الجميع", callback_data="adm_pwlock")],
+         [InlineKeyboardButton("🔙 رجوع", callback_data="adm_refresh")]])
+
+async def admin_show_pw_exempt(q):
+    ex = cfg_get('pw_exempt', []) or []
+    lines, rows = [], []
+    for uid in ex[:30]:
+        rec = db_get(f"users/{uid}") or {}
+        name = rec.get('name') or '—'
+        un = f" @{_esc(rec['username'])}" if rec.get('username') else ''
+        lines.append(f"• {_esc(name)}{un} <code>{uid}</code>")
+        rows.append([InlineKeyboardButton(f"🗑 {name[:22] if name != '—' else uid}", callback_data=f"adm_pwexdel_{uid}")])
+    rows.append([InlineKeyboardButton("➕ إضافة", callback_data="adm_pwexadd")])
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="adm_pw")])
+    await _edit(q, "👤 <b>المستثنين من الباسورد</b>\n\n" + ("\n".join(lines) if lines else "ما فيه أحد مستثنى."), rows)
 
 async def admin_show_text(q, key):
     meta = TEXTS[key]
@@ -606,7 +1027,7 @@ async def admin_show_retention(q):
         logger.info(f"[admin_show_retention] {e}")
 
 async def admin_wait_input(upd, ctx, wait):
-    """يستقبل رد المطور بعد ضغط 'تعديل' أو 'مدة مخصصة'."""
+    """يستقبل رد المطور بعد ضغط زر يحتاج إدخال (نص/قناة/باسورد/مدة...)."""
     msg = upd.message
     raw = (msg.text or '').strip()
     if time.time() - wait.get('ts', 0) > 600:
@@ -615,8 +1036,9 @@ async def admin_wait_input(upd, ctx, wait):
     if raw in ('الغاء', 'إلغاء', 'cancel'):
         ctx.user_data.pop('adm_wait', None)
         return await msg.reply_text("❎ تم الإلغاء. /admin للرجوع للقائمة.")
-    if wait['kind'] == 'retention':
-        digits = raw.translate(str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789'))
+    kind = wait['kind']
+    digits = raw.translate(_ARABIC_DIGITS)
+    if kind == 'retention':
         if not digits.isdigit() or not 1 <= int(digits) <= 720:
             return await msg.reply_text("❌ أرسل عدد ساعات من 1 إلى 720 (30 يوم)، أو اكتب «الغاء».")
         h = int(digits)
@@ -624,7 +1046,7 @@ async def admin_wait_input(upd, ctx, wait):
         ctx.user_data.pop('adm_wait', None)
         return await msg.reply_text(f"✅ صارت مدة حفظ الرسائل <b>{_fmt_hours(h)}</b> (تطبق على الرسائل الجديدة).\n/admin للرجوع.",
                                     parse_mode="HTML")
-    if wait['kind'] == 'text':
+    if kind == 'text':
         key = wait.get('key')
         if key not in TEXTS:
             ctx.user_data.pop('adm_wait', None)
@@ -639,7 +1061,64 @@ async def admin_wait_input(upd, ctx, wait):
             return await msg.reply_text("❌ تنسيق النص غير صالح — جرب مرة ثانية أو اكتب «الغاء».")
         db_set(f"texts/{key}", new)
         ctx.user_data.pop('adm_wait', None)
-        await msg.reply_text("✅ تم الحفظ — من الآن البوت يستخدم هذا النص.\n/admin للرجوع.")
+        return await msg.reply_text("✅ تم الحفظ — من الآن البوت يستخدم هذا النص.\n/admin للرجوع.")
+    if kind == 'channel':
+        origin = getattr(msg, 'forward_origin', None)
+        target = None
+        if origin is not None and getattr(origin, 'type', '') == 'channel':
+            target = origin.chat.id
+        elif re.fullmatch(r'-100\d{5,}', digits):
+            target = int(digits)
+        else:
+            m = re.fullmatch(r'(?:https?://t\.me/|@)([A-Za-z][A-Za-z0-9_]{4,})', raw)
+            if m: target = '@' + m.group(1)
+        if target is None:
+            return await msg.reply_text(
+                "❌ ما فهمت. أرسل آيدي القناة مثل <code>-1001234567890</code> أو @يوزر القناة، أو حوّل (Forward) رسالة من القناة. (أو اكتب «الغاء»)",
+                parse_mode="HTML")
+        try:
+            chat = await ctx.bot.get_chat(target)
+        except Exception as e:
+            return await msg.reply_text(f"❌ ما كدرت أوصل للقناة ({type(e).__name__}).\nتأكد أن البوت مضاف أدمن بالقناة والآيدي صحيح.")
+        if getattr(chat, 'type', '') != 'channel':
+            return await msg.reply_text("❌ هذا مو قناة. أرسل آيدي قناة.")
+        cfg_set('channel_id', chat.id)
+        ctx.user_data.pop('adm_wait', None)
+        return await msg.reply_text(
+            f"✅ تم تحديد القناة: <b>{_esc(chat.title or '')}</b>\n<code>{chat.id}</code>\n\n"
+            "اضغط «🧪 تجربة» من /admin ← 📢 القناة للتأكد.", parse_mode="HTML")
+    if kind == 'pw_set':
+        if not re.fullmatch(r'\d{4}', digits):
+            return await msg.reply_text("❌ لازم 4 أرقام بالضبط (مثال: 1234)، أو اكتب «الغاء».")
+        cfg_set('pw_value', digits)
+        ctx.user_data.pop('adm_wait', None)
+        try: await msg.delete()
+        except Exception: pass
+        return await ctx.bot.send_message(msg.chat_id, "✅ تم تغيير الباسورد (مسحت رسالتك حتى ما يبقى بالمحادثة).\nتشوفه من /admin ← 🔐 كلمة المرور.")
+    if kind == 'pw_exempt_add':
+        uid = None
+        if re.fullmatch(r'\d{5,}', digits):
+            uid = int(digits)
+        else:
+            uname = raw.lstrip('@').lower()
+            for path, rec in _users_all().items():
+                if (rec.get('username') or '').lower() == uname:
+                    uid = int(path.split('/', 1)[1]); break
+        if uid is None:
+            return await msg.reply_text("❌ ما لقيت هذا اليوزر بقاعدة المستخدمين. أرسل الآيدي الرقمي، أو خلّيه يضغط /start أول. (أو «الغاء»)")
+        ex = list(cfg_get('pw_exempt', []) or [])
+        if uid not in ex:
+            ex.append(uid); cfg_set('pw_exempt', ex)
+        ctx.user_data.pop('adm_wait', None)
+        return await msg.reply_text(f"✅ انضاف للمستثنين: <code>{uid}</code>\n/admin للرجوع.", parse_mode="HTML")
+
+async def admin_forward_handler(upd, ctx):
+    """تحويل رسالة غير نصية من القناة أثناء انتظار تعيين القناة."""
+    msg = upd.message
+    if not msg or not is_dev(msg.from_user): return
+    wait = ctx.user_data.get('adm_wait')
+    if wait and wait.get('kind') == 'channel':
+        await admin_wait_input(upd, ctx, wait)
 
 def get_settings(cid):
     return db_get(f"settings/{cid}", {
@@ -979,6 +1458,9 @@ async def yt_handler(upd, ctx, url, uid):
     uhash = str(random.randint(10000,99999))
     ctx.bot_data[uhash] = url
     ctx.bot_data[url[:60]+'_fmt'] = format_map
+    _ll = _cur_ll.get()
+    if _ll is not None:
+        _ll.set_pending(); ctx.bot_data['ll_' + uhash] = _ll
 
     dur   = info.get('duration', 0)
     views = info.get('view_count', 0)
@@ -1553,13 +2035,13 @@ async def _insta_download_and_send(ctx, cid, url, wm, username="", download_all=
                 batch = images[i:i + 10]
                 if len(batch) == 1:
                     with open(batch[0], 'rb') as f:
-                        await ctx.bot.send_photo(cid, f, caption=f"📸 {title[:60]}")
+                        await send_safe(ctx.bot.send_photo(cid, f, caption=f"📸 {title[:60]}"))
                 else:
                     handles = []; grp = []
                     for img in batch:
                         fh = open(img, 'rb'); handles.append(fh)
                         grp.append(InputMediaPhoto(fh))
-                    try: await ctx.bot.send_media_group(cid, grp)
+                    try: await send_safe(ctx.bot.send_media_group(cid, grp))
                     finally:
                         for fh in handles: fh.close()
                 if i + 10 < len(images): await asyncio.sleep(1)
@@ -1665,6 +2147,9 @@ async def insta_stories_handler(upd, ctx, username, cid):
     all_url = f"https://www.instagram.com/stories/{username}/"
     shash = str(random.randint(10000,99999))
     ctx.bot_data[f'ist_{shash}'] = {'url': all_url, 'all_url': all_url, 'uname': username}
+    _ll = _cur_ll.get()
+    if _ll is not None:
+        _ll.set_pending(); ctx.bot_data[f'ist_{shash}']['ll'] = _ll
 
     markup = InlineKeyboardMarkup([[
         InlineKeyboardButton("📥 آخر ستوري", callback_data=f"ist_one_{shash}"),
@@ -1717,7 +2202,7 @@ async def pinterest_handler(upd, ctx, url, cid):
                 if ext in ('mp4','webm','mkv'):
                     with open(fp,'rb') as f: await send_safe(ctx.bot.send_video(cid,f,caption=f"📌 {title[:60]}",supports_streaming=True))
                 else:
-                    with open(fp,'rb') as f: await ctx.bot.send_photo(cid,f,caption=f"📌 {title[:60]}")
+                    with open(fp,'rb') as f: await send_safe(ctx.bot.send_photo(cid,f,caption=f"📌 {title[:60]}"))
                 return await wm.delete()
         except Exception as e2:
             logger.warning(f"[Pinterest] dl failed: {e2}")
@@ -1730,7 +2215,7 @@ async def pinterest_handler(upd, ctx, url, cid):
                 try:
                     r = requests.get(img_url, headers=headers, timeout=15)
                     if r.status_code == 200 and len(r.content) > 1000:
-                        await ctx.bot.send_photo(cid, r.content, caption=f"📌 {title[:60]}")
+                        await send_safe(ctx.bot.send_photo(cid, r.content, caption=f"📌 {title[:60]}"))
                         return await wm.delete()
                 except Exception: pass
 
@@ -1781,23 +2266,26 @@ async def music_handler(upd, ctx, url, cid, platform="🎵"):
     try:
         fp,title,artist = await asyncio.get_running_loop().run_in_executor(None, _dl)
         if fp and os.path.exists(fp) and os.path.getsize(fp) > TG_MAX_BYTES:
+            _ll_fail("الملف أكبر من 50MB")
             await wm.edit_text("❌ الملف أكبر من 50MB (حد تيليقرام للبوتات).\n• جرب مقطع أقصر")
         elif fp and os.path.exists(fp):
             await wm.edit_text("📤 جاري الرفع...")
             with open(fp,'rb') as f:
-                await ctx.bot.send_audio(
+                await send_safe(ctx.bot.send_audio(
                     cid, f,
                     title=title or "audio",
                     performer=artist or "Unknown",
                     caption=f"{platform} <b>{title[:60]}</b>" if title else platform,
                     parse_mode="HTML"
-                )
+                ))
             await wm.delete()
         else:
+            _ll_fail("فشل التحميل")
             await wm.edit_text("❌ فشل التحميل.")
     except Exception as e:
         err = str(e)
         logger.error(f"[Music] {err}")
+        _ll_fail(err[:200])
         if 'sign in' in err.lower() or 'bot' in err.lower():
             has_yt_c = 'youtube.com' in open('cookies.txt').read() if os.path.exists('cookies.txt') else False
             if not has_yt_c:
@@ -1872,8 +2360,8 @@ async def spotify_handler(upd, ctx, url, cid):
         for fp in files[:10]:
             name = os.path.basename(fp).rsplit('.', 1)[0]
             with open(fp, 'rb') as f:
-                await ctx.bot.send_audio(cid, f,
-                    title=name[:64], caption=f"🎧 {name[:60]}")
+                await send_safe(ctx.bot.send_audio(cid, f,
+                    title=name[:64], caption=f"🎧 {name[:60]}"))
         await wm.delete()
     except Exception as e:
         logger.error(f"[Spotify] {e}")
@@ -2138,7 +2626,7 @@ async def cmd_id(upd, ctx):
 
 async def cmd_start(upd, ctx):
     msg = upd.message
-    await register_user(upd, ctx)
+    await register_user(upd, ctx, notify=True)   # (البوابة تسجّله قبل، وهذا احتياط — ما يكرر الإشعار)
     if msg.chat.type == 'private' and msg.text.startswith('/start w_'):
         try:
             parts = msg.text.replace('/start w_','').split('_')
@@ -2157,6 +2645,19 @@ async def cmd_start(upd, ctx):
 # 9. معالج الأزرار
 # ═══════════════════════════════════════════════════════════════════
 async def btn_cb(upd, ctx):
+    """يربط أزرار الجودة بسجل الرابط بالقناة (إن وُجد)، ثم يكمل المعالج الأصلي."""
+    q = upd.callback_query
+    d = (q.data or '') if q else ''
+    ll = None
+    if d.startswith('dl_'):
+        parts = d.split('_', 3)
+        if len(parts) == 4: ll = ctx.bot_data.get('ll_' + parts[3])
+    if ll is None:
+        return await _btn_cb(upd, ctx)
+    async with ll_scope(ll):
+        return await _btn_cb(upd, ctx)
+
+async def _btn_cb(upd, ctx):
     q = upd.callback_query
     d = q.data
 
@@ -2195,7 +2696,9 @@ async def btn_cb(upd, ctx):
                 if is_photo: await q.edit_message_caption(t)
                 else: await q.edit_message_text(t)
             except Exception: pass
-        if not url: return await em("❌ الرابط منتهي. أعد إرساله.")
+        if not url:
+            _ll_fail("الرابط منتهي")
+            return await em("❌ الرابط منتهي. أعد إرساله.")
         await em("⏳ جاري تحضير الملف...")
         mt = "audio" if action=="audio" else "video"
         ql = action.replace("v","") if action.startswith("v") and action!="video" else "720"
@@ -2229,16 +2732,20 @@ async def btn_cb(upd, ctx):
             fp,title,tmp = await do_download(url,mt,ql,q.message.message_id,q.message.chat_id,ctx,q.message.message_id,is_photo)
 
         if fp and os.path.exists(fp) and os.path.getsize(fp) > TG_MAX_BYTES:
+            _ll_fail(f"الملف أكبر من 50MB ({os.path.getsize(fp) // 1048576}MB)")
             await em(f"❌ الملف أكبر من 50MB ({os.path.getsize(fp) // 1048576}MB) — حد تيليقرام للبوتات.\n• جرب جودة أقل")
         elif fp and os.path.exists(fp):
             await em("📤 جاري الرفع...")
             try:
                 with open(fp,'rb') as f:
-                    if mt=="audio": await ctx.bot.send_audio(q.message.chat_id,f,title=title or "audio")
+                    if mt=="audio": await send_safe(ctx.bot.send_audio(q.message.chat_id,f,title=title or "audio"))
                     else: await send_safe(ctx.bot.send_video(q.message.chat_id,f,caption=f"✅ {(title or '')[:200]}",supports_streaming=True))
                 await q.message.delete()
-            except Exception as e: await em(f"❌ فشل الرفع: {str(e)[:80]}")
+            except Exception as e:
+                _ll_fail(f"فشل الرفع: {str(e)[:150]}")
+                await em(f"❌ فشل الرفع: {str(e)[:80]}")
         else:
+            _ll_fail("فشل التحميل")
             await em("❌ فشل التحميل.\n• جرب جودة أقل\n• أو جرب لاحقاً")
         if tmp: shutil.rmtree(tmp, ignore_errors=True)
         return
@@ -2361,6 +2868,96 @@ async def btn_cb(upd, ctx):
                                           parse_mode="HTML")
             except Exception as e: logger.info(f"[adm_retcustom] {e}")
             return
+        # ── القناة ──
+        if action == "chan":
+            await q.answer(); await admin_show_channel(q, ctx); return
+        if action == "chanset":
+            ctx.user_data['adm_wait'] = {'kind': 'channel', 'ts': time.time()}
+            await q.answer()
+            await _edit(q, "📢 أرسل <b>آيدي القناة</b> (مثل <code>-1001234567890</code>) أو @يوزر القناة، "
+                           "أو <b>حوّل (Forward)</b> أي رسالة من القناة هنا.\n\nلازم تضيف البوت أدمن بالقناة (صلاحية نشر الرسائل) قبل.\n"
+                           "اكتب <code>الغاء</code> للإلغاء.", [])
+            return
+        if action == "chantest":
+            ch = _channel_id()
+            if ch is None: return await q.answer("❌ حدد القناة أول", show_alert=True)
+            try:
+                await ctx.bot.send_message(ch, "🧪 <b>رسالة تجربة</b>\n\n✅ البوت يكدر يرسل لهذي القناة.\n"
+                                               f"🕒 {_dt.datetime.now(_dt.timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC", parse_mode="HTML")
+                await q.answer("✅ انرسلت رسالة التجربة بالقناة", show_alert=True)
+            except Forbidden:
+                await q.answer("❌ البوت ما عنده صلاحية النشر. أضفه أدمن بالقناة مع صلاحية «نشر الرسائل».", show_alert=True)
+            except BadRequest as e:
+                await q.answer(f"❌ {str(e)[:150]}\nتأكد أن الآيدي صحيح وأن البوت مضاف للقناة.", show_alert=True)
+            except Exception as e:
+                await q.answer(f"❌ {type(e).__name__}: {str(e)[:120]}", show_alert=True)
+            return
+        if action == "chanclear":
+            cfg_set('channel_id', None)
+            await q.answer("🗑 انشالت القناة — الإشعارات ترجع لخاصك")
+            await admin_show_channel(q, ctx); return
+        if action == "linklog":
+            cfg_set('linklog_on', not cfg_get('linklog_on', True))
+            await q.answer("🔗 تم"); await admin_show_channel(q, ctx); return
+        # ── المستخدمين ──
+        if action == "users":
+            await q.answer(); await admin_show_users(q); return
+        if action == "usersexp":
+            users = _users_all()
+            await q.answer("📄 جاري التجهيز...")
+            data = _users_export_text(users).encode('utf-8')
+            await ctx.bot.send_document(q.message.chat_id, document=io.BytesIO(data),
+                                        filename=f"users_{_dt.datetime.now(_dt.timezone.utc).strftime('%Y%m%d')}.txt",
+                                        caption=f"👥 عدد المستخدمين: {len(users)}")
+            return
+        # ── الصيانة ──
+        if action == "maint":
+            on = not cfg_get('maintenance', False)
+            cfg_set('maintenance', on)
+            await q.answer("🔧 البوت الحين بالصيانة (مقفول للمستخدمين)" if on else "🟢 رجع البوت طبيعي", show_alert=True)
+            await cmd_admin_refresh(q, ctx); return
+        # ── كلمة المرور ──
+        if action == "pw":
+            await q.answer(); await admin_show_pw(q); return
+        if action == "pwtoggle":
+            if not _pw_on() and not cfg_get('pw_value', ''):
+                return await q.answer("❌ حدد الباسورد أول (🔑 تغيير الباسورد)", show_alert=True)
+            cfg_set('pw_enabled', not cfg_get('pw_enabled', False))
+            await q.answer("🔐 تم"); await admin_show_pw(q); return
+        if action == "pwset":
+            ctx.user_data['adm_wait'] = {'kind': 'pw_set', 'ts': time.time()}
+            await q.answer()
+            await _edit(q, "🔑 أرسل <b>الباسورد الجديد</b> (4 أرقام).\nراح أمسح رسالتك بعد الحفظ.\nاكتب <code>الغاء</code> للإلغاء.", [])
+            return
+        if action == "pwlock":
+            await q.answer()
+            await _edit(q, "🔒 <b>قفل الجميع؟</b>\n\nكل المستخدمين لازم يدخلون الباسورد من جديد (المستثنين ما يتأثرون).",
+                        [[InlineKeyboardButton("✅ نعم، اقفل", callback_data="adm_pwlockyes"),
+                          InlineKeyboardButton("❌ لا", callback_data="adm_pw")]])
+            return
+        if action == "pwlockyes":
+            cfg_set('pw_gen', _pw_gen() + 1)
+            await q.answer("🔒 انقفل الجميع", show_alert=True)
+            await admin_show_pw(q); return
+        if action == "pwex":
+            await q.answer(); await admin_show_pw_exempt(q); return
+        if action == "pwexadd":
+            ctx.user_data['adm_wait'] = {'kind': 'pw_exempt_add', 'ts': time.time()}
+            await q.answer()
+            await _edit(q, "➕ أرسل <b>آيدي</b> الشخص (رقم) أو <b>@يوزره</b> (لازم يكون ضغط /start قبل).\nاكتب <code>الغاء</code> للإلغاء.", [])
+            return
+        if action.startswith("pwexdel_"):
+            try: uid = int(action[8:])
+            except ValueError: return await q.answer("❌", show_alert=True)
+            ex = [x for x in (cfg_get('pw_exempt', []) or []) if x != uid]
+            cfg_set('pw_exempt', ex)
+            await q.answer("🗑 انشال"); await admin_show_pw_exempt(q); return
+        if action == "textspw":
+            await q.answer()
+            await _edit(q, "✏️ <b>رسائل الباسورد</b>\n\nاختر الرسالة:",
+                        [[InlineKeyboardButton(("✏️ " if db_get(f"texts/{k}") else "") + m['label'], callback_data=f"adm_t_{k}")]
+                         for k, m in TEXTS.items() if k.startswith('pw_')] + [[InlineKeyboardButton("🔙 رجوع", callback_data="adm_pw")]])
+            return
         # ── إشعار المستخدمين الجدد ──
         if action == "newuser":
             on = not cfg_get('notify_new_users', True)
@@ -2386,12 +2983,13 @@ async def btn_cb(upd, ctx):
         all_url  = data['all_url']  # رابط كل الستوريات
         uname    = data['uname']
 
-        if action == 'one':
-            await _insta_download_and_send(ctx, cid_q, url, wm,
-                                           username=uname, download_all=False, is_story=True, user=q.from_user)
-        else:
-            await _insta_download_and_send(ctx, cid_q, all_url, wm,
-                                           username=uname, download_all=True, is_story=True, user=q.from_user)
+        async with ll_scope(data.get('ll')):
+            if action == 'one':
+                await _insta_download_and_send(ctx, cid_q, url, wm,
+                                               username=uname, download_all=False, is_story=True, user=q.from_user)
+            else:
+                await _insta_download_and_send(ctx, cid_q, all_url, wm,
+                                               username=uname, download_all=True, is_story=True, user=q.from_user)
         ctx.bot_data.pop(f'ist_{shash}', None)
         return
 
@@ -2631,18 +3229,18 @@ async def handle_msg(upd, ctx):
         # روابط بالخاص
         url = find_url(text)
         if url:
-            if host_in(url,'music.youtube.com'): await music_handler(upd,ctx,url,cid,"🎵"); return
-            if host_in(url,'soundcloud.com'): await music_handler(upd,ctx,url,cid,"🎶"); return
-            if host_in(url,'spotify.com'): await spotify_handler(upd,ctx,url,cid); return
-            if host_in(url,'threads.net'): await auto_download(upd,ctx,url,cid,"🧵"); return
-            if host_in(url,'youtube.com','youtu.be'): await yt_handler(upd,ctx,url,uid); return
-            if host_in(url,'x.com','twitter.com'): await x_handler(upd,ctx,url,uid); return
-            if host_in(url,'tiktok.com','douyin.com'): await tiktok_handler(upd,ctx,url,cid,msg.message_id); return
-            if host_in(url,'facebook.com','fb.watch','fb.com'): await fb_handler(upd,ctx,url,uid); return
-            if host_in(url,'pinterest.com','pin.it'): await pinterest_handler(upd,ctx,url,cid); return  # auto best
+            if host_in(url,'music.youtube.com'): await run_logged(upd,ctx,'youtube music',url,music_handler,upd,ctx,url,cid,"🎵"); return
+            if host_in(url,'soundcloud.com'): await run_logged(upd,ctx,'soundcloud',url,music_handler,upd,ctx,url,cid,"🎶"); return
+            if host_in(url,'spotify.com'): await run_logged(upd,ctx,'spotify',url,spotify_handler,upd,ctx,url,cid); return
+            if host_in(url,'threads.net'): await run_logged(upd,ctx,'threads',url,auto_download,upd,ctx,url,cid,"🧵"); return
+            if host_in(url,'youtube.com','youtu.be'): await run_logged(upd,ctx,'youtube',url,yt_handler,upd,ctx,url,uid); return
+            if host_in(url,'x.com','twitter.com'): await run_logged(upd,ctx,'x',url,x_handler,upd,ctx,url,uid); return
+            if host_in(url,'tiktok.com','douyin.com'): await run_logged(upd,ctx,'tiktok',url,tiktok_handler,upd,ctx,url,cid,msg.message_id); return
+            if host_in(url,'facebook.com','fb.watch','fb.com'): await run_logged(upd,ctx,'facebook',url,fb_handler,upd,ctx,url,uid); return
+            if host_in(url,'pinterest.com','pin.it'): await run_logged(upd,ctx,'pinterest',url,pinterest_handler,upd,ctx,url,cid); return  # auto best
         m=re.match(r'^ستوري\s+@?(\S+)',text,re.I)
-        if m: await insta_stories_handler(upd,ctx,m.group(1),cid); return
-        if url and host_in(url,'instagram.com'): await insta_handler(upd,ctx,url,cid); return
+        if m: await run_logged(upd,ctx,'instagram',f"ستوري @{m.group(1).lstrip('@')}",insta_stories_handler,upd,ctx,m.group(1),cid); return
+        if url and host_in(url,'instagram.com'): await run_logged(upd,ctx,'instagram',url,insta_handler,upd,ctx,url,cid); return
 
         # تحويل فيديو لصوت بالخاص
         if text == "تحويل":
@@ -3002,14 +3600,14 @@ async def handle_msg(upd, ctx):
     if mt: await tiktok_user_info(upd, ctx, mt.group(1), cid); return
     url = find_url(text)
     if url:
-        if host_in(url,'youtube.com','youtu.be'): await yt_handler(upd,ctx,url,uid); return
-        if host_in(url,'x.com','twitter.com'): await x_handler(upd,ctx,url,uid); return
-        if host_in(url,'tiktok.com','douyin.com'): await tiktok_handler(upd,ctx,url,cid,msg.message_id); return
-        if host_in(url,'facebook.com','fb.watch','fb.com'): await fb_handler(upd,ctx,url,uid); return
-        if host_in(url,'pinterest.com','pin.it'): await pinterest_handler(upd,ctx,url,cid); return
+        if host_in(url,'youtube.com','youtu.be'): await run_logged(upd,ctx,'youtube',url,yt_handler,upd,ctx,url,uid); return
+        if host_in(url,'x.com','twitter.com'): await run_logged(upd,ctx,'x',url,x_handler,upd,ctx,url,uid); return
+        if host_in(url,'tiktok.com','douyin.com'): await run_logged(upd,ctx,'tiktok',url,tiktok_handler,upd,ctx,url,cid,msg.message_id); return
+        if host_in(url,'facebook.com','fb.watch','fb.com'): await run_logged(upd,ctx,'facebook',url,fb_handler,upd,ctx,url,uid); return
+        if host_in(url,'pinterest.com','pin.it'): await run_logged(upd,ctx,'pinterest',url,pinterest_handler,upd,ctx,url,cid); return
     m=re.match(r'^ستوري\s+@?(\S+)',text,re.I)
-    if m: await insta_stories_handler(upd,ctx,m.group(1),cid); return
-    if url and host_in(url,'instagram.com'): await insta_handler(upd,ctx,url,cid); return
+    if m: await run_logged(upd,ctx,'instagram',f"ستوري @{m.group(1).lstrip('@')}",insta_stories_handler,upd,ctx,m.group(1),cid); return
+    if url and host_in(url,'instagram.com'): await run_logged(upd,ctx,'instagram',url,insta_handler,upd,ctx,url,cid); return
 
     # ذكاء اصطناعي في الكروب
     if s.get("ai_mode"):
@@ -3125,6 +3723,8 @@ def main():
         media_filter), group=0)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,track_msg), group=1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_msg), group=2)
+    app.add_handler(TypeHandler(Update, gate), group=-1)   # صيانة + باسورد قبل أي معالج
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.FORWARDED & ~filters.TEXT, admin_forward_handler), group=3)
     logger.info("🚀 Bot started!")
     # شغّل HTTP health server لـ Render
     _start_health_server()
